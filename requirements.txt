@@ -1,0 +1,10 @@
+pandas
+numpy
+matplotlib
+seaborn
+statsmodels
+prophet
+scikit-learn
+xgboost
+jupyter
+notebook
