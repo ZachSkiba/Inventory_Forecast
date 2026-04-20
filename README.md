@@ -1,4 +1,4 @@
-# TriXpense Predictive Analytics
+# Credit Card Transactions Predictive Analytics
 Predicting monthly user spending using time series forecasting.
 
 ## Dataset
@@ -10,6 +10,6 @@ Place both files in data/raw/
 pip install -r requirements.txt
 
 ## Notebooks
-- 01_eda.ipynb — data loading, cleaning, EDA, seasonal decomposition
-- 02_sarima.ipynb — SARIMA model, forecast, evaluation
-- 03_prophet.ipynb — Prophet model, forecast, comparison with SARIMA
+- 01_eda.ipynb ï¿½ data loading, cleaning, EDA, seasonal decomposition
+- 02_sarima.ipynb ï¿½ SARIMA model, forecast, evaluation
+- 03_prophet.ipynb ï¿½ Prophet model, forecast, comparison with SARIMA
