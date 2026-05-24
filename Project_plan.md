@@ -99,12 +99,13 @@ This project goes beyond prediction:
 
 | Group | Features | EDA Justification |
 |---|---|---|
-| Temporal (8) | `day_of_week`, `day_of_month`, `week_of_year`, `month_num`, `is_weekend`, `is_month_start`, `is_month_end` | Calendar cycles in seasonal decomposition |
+| Temporal (7) | `day_of_week`, `day_of_month`, `week_of_year`, `month_num`, `is_weekend`, `is_month_start`, `is_month_end` | Calendar cycles in seasonal decomposition |
 | Event/SNAP (5) | `is_event`, `is_closed_holiday`, `days_to_closed_holiday`, `is_pre_closed_holiday`, `is_snap` | SNAP: +10–32% FOODS uplift by state. Christmas/Thanksgiving demand lives in lead days |
-| Price (6) | `sell_price`, `price_change_pct`, `price_change_pct_raw`, `price_drop`, `price_increase`, `price_rel_28` | Asymmetric elasticity confirmed: r=0.553 drops vs r=0.18 increases at product-store level |
+| Price (5) | `sell_price`, `price_change_pct`, `price_drop`, `price_increase`, `price_rel_28` | Asymmetric elasticity confirmed: r=0.553 drops vs r=0.18 increases at product-store level |
 | Lag/Rolling (7) | `lag_1`, `lag_7`, `lag_14`, `lag_28`, `rolling_mean_7`, `rolling_mean_28`, `rolling_std_7` | SARIMA AR(1) p≈0.000 — recent demand is strongest predictor |
 | Hierarchical (4) | `store_rolling_7`, `store_rolling_28`, `dept_rolling_7`, `dept_rolling_28` | Stores vary 3x in size; departments correlated 0.64–0.96 but not perfectly |
 | Categoricals (6) | `store_id_enc`, `item_id_enc`, `dept_id_enc`, `cat_id_enc`, `state_id_enc`, `weekday_enc` | XGBoost needs integer-encoded IDs to learn per-store/dept demand baselines |
+| **Total** | **34** | |
 
 #### Deliberately Excluded
 
