@@ -1,1229 +1,1118 @@
 # Forward Plan — Retail Demand Intelligence System
-## Strategy B: Full Improvement Pipeline Before Fold 3
+## Updated Strategy: SKU-Level Inventory Decision Engine
 
-**Current state:** 05b validation diagnostics complete. Fold 2 signoff issued.
-Fold 3 has never been touched. All improvements below are implemented before
-Fold 3 is opened — no leakage risk.
+**Current state:** `06b_model_selection.ipynb` complete. Tweedie LightGBM is
+the production model. Global isotonic calibration rejected — overcorrects
+at series level (median demand ratio 2.3–2.5×, p90 at 7–8× actual demand).
+Winner lock-in (`WINNER_MODEL`, `WINNER_VARIANT`) is the immediate next step.
 
-**Discipline:** Fold 3 is run exactly once, at the end of this plan.
-Any decision to retrain after seeing Fold 3 results is test set contamination.
+**Fold 3 discipline:** Fold 3 is run exactly once, at the very end of this
+plan, after all modeling, optimization, uncertainty quantification, and
+inventory simulation are locked on Fold 2. Any decision to retrain after
+seeing Fold 3 results is test set contamination. This is non-negotiable.
 
----
-
-## Principal Reviewer Notes — What Changed and Why
-
-This section documents every structural change from the previous plan and the
-statistical reasoning behind each decision. It is included so the project
-history is auditable.
-
-### Change 1 — Calibration method replaced: fixed buckets → isotonic regression
-
-**DELETED:** The fixed six-bucket additive correction scheme from the previous
-plan (Section 6 of `05c_xgboost_v2.ipynb`).
-
-**REPLACED WITH:** Isotonic regression fit on the Fold 2 (val) residual curve,
-with a Fold 2 performance gate before the method is adopted.
-
-**Reasoning:**
-
-Fixed bucket corrections have three problems that are serious enough to
-disqualify them as the primary production method:
-
-First, the bins are arbitrary. The boundaries `[0, 0.1, 0.3, 0.5, 0.7, 0.9,
-1.0]` are round numbers with no statistical basis. Series near a boundary
-(e.g., a series with zero rate 0.299 vs 0.301) receive very different
-corrections despite nearly identical sparsity structure. This discontinuity
-is indefensible in a production system and would be the first question a
-hiring manager asks.
-
-Second, the corrections are computed as mean bias per bucket. But bias within
-a bucket is not flat — it has a gradient. A linear or monotone smooth fit
-over the gradient captures the within-bucket variation that the step function
-cannot. The Section 8h scatter plot from 05b shows the zero rate vs bias
-relationship is smooth and monotone — exactly the shape that isotonic
-regression is designed for. Using a step function on a smooth empirical
-relationship throws away information.
-
-Third, the bucket corrections come from mean residuals on the Fold 2 val
-window. But val rows are not i.i.d. — they are time-series rows with serial
-correlation. Mean residuals are not an unbiased estimate of the correction
-needed for a future window. A smoother method with a performance gate gives
-protection against overfitting the correction to Fold 2's specific demand
-patterns.
-
-**Why not linear regression?** Linear regression on zero rate is the simplest
-alternative and would be defensible. However, the zero rate vs bias
-relationship is monotone but not provably linear — the rate of increase in
-bias may slow above 70–80% zero rate (ceiling effect from the log-space
-target floor). Isotonic regression is non-parametric and makes no linearity
-assumption while still enforcing the monotone constraint that is theoretically
-required. It has fewer degrees of freedom than a full polynomial and is no
-more expensive to fit.
-
-**Why not a full isotonic regression on every prediction?** Fitting isotonic
-regression on raw prediction order would be target leakage — the sort order
-includes val target information. The correct approach is to fit isotonic
-regression on the zero rate vs mean residual relationship using training data
-(zero rate from training history, residuals from Fold 2 val), so the fit
-uses only quantities available at inference time.
-
-**Why not a two-stage classify-then-regress model?** A two-stage architecture
-is the statistically correct long-run answer to zero-inflated demand and would
-improve both bias and RMSE. However, it requires a separate classification
-head, a separate training objective, and a blending weight — significant
-additional scope. The isotonic calibration layer is the production team's
-bridge: it ships the improvement in this sprint while the architecture
-redesign goes on the backlog. Both belong in the portfolio; the calibration
-layer is not a permanent substitute.
-
-**Leakage status of isotonic calibration:** The calibration is fit using:
-- Zero rate per series, computed from the Fold 2 *training* window (not val)
-- Mean residual per zero-rate percentile group, computed from Fold 2 *val*
-
-The val residuals carry information about val targets. This is intentional:
-the calibration layer is explicitly post-hoc. The rule against leakage applies
-to model training, not to post-hoc calibration that is transparently labeled
-and validation-gated. A production ML team would call this a calibration stage
-and document it explicitly — which is what this plan does.
-
-### Change 2 — Calibration is not automatically accepted
-
-**DELETED:** The previous plan's design where calibration was applied
-unconditionally as part of the pipeline.
-
-**REPLACED WITH:** A three-way comparison in `05d_validation_diagnostics_v2.ipynb`:
-raw predictions, holiday-suppressed predictions, and holiday-suppressed plus
-calibrated predictions. Calibration is adopted only if it passes a quantitative
-performance gate on Fold 2.
-
-**Reasoning:** Applying a calibration layer that does not actually improve
-Fold 2 performance is strictly worse than no calibration — it introduces
-an extra component that increases pipeline complexity, creates an additional
-failure mode at inference, and adds a decision-point the reviewer must
-explain. The previous plan treated calibration as an improvement by assumption.
-A principal-level review treats it as an improvement by evidence.
-
-### Change 3 — Fold 3 calibration design corrected
-
-**DELETED:** The instruction to "recompute zero-rate corrections from Fold 3
-training data using the same bucket method."
-
-**REPLACED WITH:** If calibration is approved in 05d, the identical isotonic
-regression workflow is applied at Fold 3 using Fold 3 training data. The
-calibration curve is re-fit — not hardcoded from Fold 2 values. The
-performance gate is not re-evaluated at Fold 3 (that decision was made in
-05d and is locked).
-
-**Reasoning:** Hardcoding Fold 2 correction values at Fold 3 is conceptually
-wrong. The Fold 3 training window extends one full year further than Fold 2
-(Feb 2011 → Jan 2015 instead of Feb 2011 → Jan 2014). The zero rate
-distribution of series changes as new products enter and exit the assortment.
-Re-fitting from Fold 3 training data is correct. But re-evaluating whether to
-use calibration at all is not — that gate closes in 05d.
-
-### Change 4 — Feature engineering approval gate added
-
-The previous plan assumed all five new features would be included. This plan
-requires a brief audit in `04b_feature_engineering_v2.ipynb` Section 7
-to confirm each feature's distribution is well-behaved before it enters
-training. This is not a Fold 2 evaluation — it is an engineering sanity
-check that would be done in any production feature pipeline.
-
-### What was NOT changed
-
-Holiday suppression remains a hard inference rule. This is correct. Stores
-are closed; sales are structurally impossible. No performance gate applies to
-a business constraint.
-
-The five new features are retained as proposed. The statistical rationale for
-each was reviewed and is sound. `item_mean_price` leakage concern is noted in
-the original plan and the fix (compute from training period only) is correct.
-`price_percentile_52w` rolling lookback is safe by construction.
-
-The Fold 3 untouched discipline is unchanged.
-
-Both models (XGBoost v2 and LightGBM) are evaluated at Fold 3. Winner
-selection is on Fold 2; Fold 3 confirms generalization.
+**Core narrative:** This project is not a forecasting model. It is a
+SKU-level inventory decision engine. Every notebook from here forward
+serves one question: given a forecast and its uncertainty, what is the
+correct reorder decision for this SKU right now?
 
 ---
 
-## Repository Structure (Final)
+## What 06b Established (Locked — Do Not Revisit)
+
+| Decision | Rationale |
+|---|---|
+| Production model: LightGBM Tweedie | Predicts in unit space directly, no retransformation bias, best demand ratio across most zero-rate buckets |
+| Production variant: suppressed only | Holiday suppression unconditional. Isotonic calibration rejected — series-level overcorrection proved by demand ratio distribution |
+| XGBoost retired as primary candidate | Systematic underprediction (demand ratio 0.761), log-space retransformation bias. Retained in comparison tables only |
+| Primary metric: per-SKU weekly WAPE | Aggregate WAPE masks SKU-level behavior. All optimization decisions from here use SKU-level WAPE distribution, not aggregate |
+| Calibration status: rejected | Median demand ratio 2.315 (XGB) / 2.516 (Tweedie) post-calibration. p90 at 7–8× actual. Architecturally wrong for series-level correction |
+
+---
+
+## Key Architectural Decisions for the Forward Plan
+
+### Decision 1 — SKU Routing: Demand Regime Classification (Syntetos-Boylan)
+
+**Problem:** A single global model cannot serve all SKU types well. Forcing
+Tweedie on Lumpy/Intermittent SKUs produces WAPE > 100% with no path to
+improvement — the signal is not there.
+
+**Solution:** Route SKUs to the appropriate forecasting method based on their
+demand pattern, not on model performance metrics. Demand regime is a property
+of the historical sales data — it requires no ground truth and no model
+output to compute.
+
+**Method:** Syntetos-Boylan (2005) classification using two statistics
+computed from the training window:
+
+- **ADI (Average inter-demand interval):** Total periods ÷ number of nonzero
+  periods. Measures how frequently demand occurs.
+- **CV² (Coefficient of variation squared):** Variance ÷ mean² of nonzero
+  demand observations only. Measures how variable demand size is when it does
+  occur.
+
+**Four regimes from the 2×2 grid:**
+
+| | CV² < 0.49 | CV² ≥ 0.49 |
+|---|---|---|
+| **ADI < 1.32** | Smooth — regular, stable demand | Erratic — regular, volatile demand |
+| **ADI ≥ 1.32** | Intermittent — rare, stable demand | Lumpy — rare, volatile demand |
+
+**Routing:**
+- Smooth + Erratic → LightGBM Tweedie (global model handles these well)
+- Intermittent → Croston/TSB (separates demand frequency from demand size)
+- Lumpy → TSB or historical min-max policy (model-free fallback)
+
+**Why this generalizes to production without ground truth:**
+ADI and CV² are recomputed from the expanding training window every retraining
+cycle. The classification updates as a SKU's behavior changes. No future
+demand is needed at any point. This is the same mechanism used in SAP IBP,
+Oracle Demantra, and Blue Yonder.
+
+**Regime drift handling:**
+To prevent boundary flip-flopping, apply hysteresis — a SKU only reclassifies
+if it stays in the new regime for 4+ consecutive weeks. SKUs near regime
+boundaries get flagged in the monitoring dashboard.
+
+### Decision 2 — Uncertainty Quantification: Conformal Prediction + Native Croston Variance
+
+**Problem:** Quantile regression requires separate models per quantile (q80,
+q90, q95, q99), has no coverage guarantee, and can produce crossing quantiles.
+Per-SKU safety stock cannot be principled without calibrated intervals.
+
+**Solution:** Wrap the Tweedie model with conformal prediction. This produces
+guaranteed-coverage prediction intervals at any service level from a single
+model.
+
+**How it works:**
+1. Tweedie model trained on Fold 2 training data as normal
+2. Run on Fold 2 val set — compute per-SKU residuals
+3. For each SKU, the empirical quantiles of its residual distribution define
+   the prediction intervals: the 90th percentile residual IS the q90 interval
+   by mathematical construction
+4. At inference: point forecast ± calibrated interval per SKU per service level
+5. Intervals automatically widen for uncertain SKUs and narrow for stable ones
+
+**Coverage guarantee:** If the calibration set is representative of the
+production distribution, empirical coverage matches the target level exactly.
+No distributional assumptions required. The q90 band covers 90% of actuals.
+
+**Service levels supported from one model:** q50, q75, q80, q90, q95, q99.
+User selects service level in the app; intervals come from the same conformal
+wrapper.
+
+**For Croston/TSB SKUs:** Native uncertainty comes from the variance of the
+demand size estimates and inter-demand interval estimates. No conformal
+wrapper needed — the Croston output already provides a natural buffer range.
+
+**Why overprediction is intentional:** Carrying cost < stockout cost in most
+retail contexts. Using q75 or q80 as the reorder quantity rather than q50
+deliberately biases toward slight overstock, which is the correct business
+default. Service level is configurable per SKU in the app.
+
+### Decision 3 — No Global Post-Hoc Corrections
+
+Global isotonic calibration was rejected in 06b. Department-level corrections
+are rejected for the same reason — they are the same architectural mistake at
+a finer granularity. They fit to Fold 2 val residual patterns that may not
+generalize and add pipeline complexity without addressing the root cause.
+
+The correct response to systematic bias on a SKU segment is: route those SKUs
+to a better-suited model (Croston/TSB), not correct a bad model's output.
+
+---
+
+## Immediate Next Step — Lock 06b
+
+Before any new notebook is opened, fill in the winner decision block in 06b:
+
+```python
+WINNER_MODEL   = 'tweedie'
+WINNER_VARIANT = 'suppressed'
+RATIONALE      = (
+    "Tweedie wins on unit-space RMSE (3.10 vs 3.39), demand ratio (0.776 vs "
+    "0.761), and WAPE across 4 of 5 zero-rate buckets. Predicts in unit space "
+    "directly — no retransformation bias. Global isotonic calibration rejected: "
+    "series-level demand ratio explodes to 2.3–2.5× median, p90 at 7–8× actual. "
+    "XGBoost retired. Holiday suppression unconditional."
+)
+```
+
+Save `winner_decision_fold2.pkl`. This is the formal gate. No new notebook
+runs until this is committed.
+
+---
+
+## Repository Structure (Updated)
 
 ```
 retail-demand-intelligence/
 ├── data/
-├── raw/
-└── processed/
-    ├── features/
-    │   ├── features_train.parquet          ← v1 (frozen, never overwritten)
-    │   ├── features_val.parquet            ← v1 (frozen, never overwritten)
-    │   ├── feature_cols.pkl                ← v1
-    │   ├── features_train_v2.parquet       ← v2 (new features)
-    │   ├── features_val_v2.parquet         ← v2 (new features)
-    │   ├── feature_cols_v2.pkl             ← v2
-    │   └── item_mean_price_lookup.pkl      ← v2 (training-period means, used at inference)
-    ├── models/
-    │   ├── xgb_v1_model_fold2.json         ← v1 (frozen)  [not found — may not have been saved in 05]
-    │   ├── xgb_v2_model_fold2.json         ← v2 Fold 2 trained model
-    │   ├── xgb_v2_model_fold3.json         ← v2 Fold 3 (07, not yet run)
-    │   ├── lgbm_model_fold2.pkl            ← LightGBM Fold 2 (06, not yet run)
-    │   └── lgbm_model_fold3.pkl            ← LightGBM Fold 3 (07, not yet run)
-    ├── predictions/
-    │   ├── xgb_v1_predictions_fold2.parquet  ← v1 (frozen)  [not found — may not have been saved in 05]
-    │   ├── xgb_v2_predictions_fold2.parquet  ← v2 all three variants (raw, suppressed, calibrated)
-    │   ├── xgb_v2_predictions_fold3.parquet  ← v2 Fold 3 (07, not yet run)
-    │   ├── lgbm_predictions_fold2.parquet    ← LightGBM Fold 2 (06, not yet run)
-    │   ├── lgbm_predictions_fold3.parquet    ← LightGBM Fold 3 (07, not yet run)
-    │   └── final_model_comparison.csv        ← (07, not yet run)
-    └── calibration/
-        ├── xgb_v2_best_params.pkl            ← frozen Optuna result (Trial 41, log-RMSE 0.5764)
-        ├── isotonic_calibrator_fold2.pkl     ← fitted IsotonicRegression object (Fold 2)
-        ├── train_zero_rate_fold2.pkl         ← per-series zero rate lookup (Fold 2 training window)
-        ├── isotonic_calibrator_fold3.pkl     ← re-fit from Fold 3 training data (07, not yet run)
-        ├── train_zero_rate_fold3.pkl         ← (07, not yet run)
-        └── lgbm_best_params.pkl              ← (06, not yet run)
+│   ├── raw/
+│   └── processed/
+│       ├── features/
+│       │   ├── features_train_v2.parquet
+│       │   ├── features_val_v2.parquet
+│       │   ├── feature_cols_v2.pkl
+│       │   └── item_mean_price_lookup.pkl
+│       ├── models/
+│       │   ├── xgb_v2_model_fold2.json          ← frozen, comparison only
+│       │   ├── tweedie_model_fold2.txt           ← production candidate
+│       │   ├── tweedie_optimized_fold2.txt       ← 06d output
+│       │   └── tweedie_optimized_fold3.txt       ← 07 output
+│       ├── predictions/
+│       │   ├── tweedie_predictions_fold2.parquet
+│       │   ├── tweedie_optimized_predictions_fold2.parquet
+│       │   ├── croston_predictions_fold2.parquet
+│       │   ├── final_predictions_fold2.parquet   ← routed, all SKUs
+│       │   └── final_predictions_fold3.parquet   ← 07 output
+│       ├── calibration/
+│       │   ├── winner_decision_fold2.pkl         ← 06b lock-in
+│       │   ├── tweedie_best_params.pkl
+│       │   ├── conformal_residuals_fold2.pkl     ← 06e output
+│       │   └── conformal_residuals_fold3.pkl     ← 07 output
+│       ├── segmentation/
+│       │   ├── sku_regimes_fold2.parquet         ← 06c output
+│       │   ├── sku_regimes_fold3.parquet         ← 07 output
+│       │   └── regime_thresholds.pkl
+│       └── inventory/
+│           ├── reorder_parameters_fold2.parquet  ← 06g output
+│           ├── simulation_results_fold2.parquet  ← 06g output
+│           └── simulation_results_fold3.parquet  ← 07 output
 ├── notebooks/
-│   ├── 01_eda.ipynb                       ✅ done
-│   ├── 02_baselines_and_stats.ipynb       ✅ done
-│   ├── 03_prophet.ipynb                   ✅ done
-│   ├── 03b_prophet_stores_conclusion.ipynb ✅ done
-│   ├── 04_feature_engineering.ipynb       ✅ done (v1 — frozen)
-│   ├── 04b_feature_engineering_v2.ipynb   ← Phase 1: build next
-│   ├── 05_xgboost_demand.ipynb            ✅ done (v1 — frozen)
-│   ├── 05b_validation_diagnostics.ipynb   ✅ done (v1 — frozen)
-│   ├── 05c_xgboost_v2.ipynb               ← Phase 2: XGBoost on v2 features
-│   ├── 05d_validation_diagnostics_v2.ipynb ← Phase 3: v2 Fold 2 signoff + calibration gate
-│   ├── 06_lightgbm_demand.ipynb           ← Phase 4: LightGBM on v2 features
-│   ├── 07_fold3_final_evaluation.ipynb    ← Phase 5: Fold 3, run once, never rerun
-│   └── 08_explainability.ipynb            ← Phase 6: SHAP + anomaly detection
+│   ├── 01_eda.ipynb                              ✅ frozen
+│   ├── 02_baselines_and_stats.ipynb              ✅ frozen
+│   ├── 03_prophet.ipynb                          ✅ frozen
+│   ├── 03b_prophet_stores_conclusion.ipynb       ✅ frozen
+│   ├── 04_feature_engineering.ipynb              ✅ frozen
+│   ├── 04b_feature_engineering_v2.ipynb          ✅ frozen
+│   ├── 05_xgboost_demand.ipynb                   ✅ frozen
+│   ├── 05b_validation_diagnostics.ipynb          ✅ frozen
+│   ├── 05c_xgboost_v2.ipynb                      ✅ frozen
+│   ├── 05d_validation_diagnostics_v2.ipynb       ✅ frozen
+│   ├── 06_lightgbm_demand.ipynb                  ✅ frozen
+│   ├── 06b_model_selection.ipynb                 ← finish now (lock winner)
+│   ├── 06c_sku_audit.ipynb                       ← Phase A
+│   ├── 06d_model_optimization.ipynb              ← Phase B
+│   ├── 06e_uncertainty_quantification.ipynb      ← Phase C
+│   ├── 06f_intermittent_demand.ipynb             ← Phase D
+│   ├── 06g_inventory_simulation.ipynb            ← Phase E
+│   ├── 07_fold3_final_evaluation.ipynb           ← Phase F (run once)
+│   ├── 08_explainability.ipynb                   ← Phase G
+│   └── 09_app_data_prep.ipynb                    ← Phase H
 ├── app.py
 ├── requirements.txt
 └── README.md
 ```
 
-**Rule:** Notebooks 01–05b are frozen artifacts. They are never modified.
-They represent the v1 pipeline and serve as the documented before-state
-for the improvement narrative.
+**Rule:** Notebooks 01–06b are frozen artifacts. They document the full
+development history and are never modified. The improvement narrative
+(v1 → v2 → Tweedie → optimized → inventory engine) is built into the
+repository structure itself.
 
 ---
 
-## Phase 1 — Feature Engineering v2
-### Notebook: `04b_feature_engineering_v2.ipynb`
+## Phase A — SKU Failure Audit and Demand Regime Classification
+### Notebook: `06c_sku_audit.ipynb`
 
-Implements all three feature-level fixes identified in Section 9 of 05b.
-Produces `features_train_v2.parquet` and `features_val_v2.parquet` using
-identical fold boundaries and gap-aware lag logic as v1.
+**Purpose:** Understand exactly where and why the model fails before
+touching anything. Classify every SKU by demand regime. This is diagnostic
+only — no modeling, no optimization.
 
----
+**Section 1 — Per-SKU Weekly WAPE Audit**
 
-### Fix 1: Pre-Holiday Feature Redesign
-**Diagnostic anchor:** Section 9.3. `is_pre_closed_holiday` has mean|SHAP|=0.0000
-— functionally dead. Pre-holiday windows show RMSE=0.598, bias=−0.414 across
-69K rows. The flat binary fails to encode the continuous demand surge in the
-lead-up window.
+Compute per-SKU weekly WAPE from the 06b predictions (Tweedie suppressed).
+This is the primary diagnostic — not aggregate WAPE.
 
-**Remove:**
-- `is_pre_closed_holiday` (binary flag — zero learned contribution)
+- Full histogram of per-SKU weekly WAPE (not percentiles — the full shape)
+- WAPE vs mean daily demand scatter — is catastrophic error concentrated in
+  low-volume SKUs?
+- WAPE vs zero rate scatter — find the cliff where the model breaks
+- Per-SKU demand ratio distribution — what does the tail look like on both
+  sides?
+- What % of total sales revenue sits in each WAPE band — a SKU with 200%
+  WAPE matters far less if it represents 0.1% of revenue
 
-**Add:**
-```python
-# Continuous proximity signal — peaks at 14 days out, decays to 0 at 15+
-# Gives the model a ramp shape rather than a step function
-df['days_to_holiday_proximity'] = (
-    (14 - df['days_to_closed_holiday'])
-    .clip(lower=0)
-    .where(df['days_to_closed_holiday'] > 0, 0)
-)
+Do not define tiers from WAPE. This section is purely diagnostic. The tiers
+come from the demand regime classification below.
 
-# Category-specific pre-holiday interaction
-# FOODS surges 3–5 days before Thanksgiving; HOBBIES surges 7–14 days before Christmas
-# A flat binary cannot capture this — a category interaction can
-df['preholiday_x_cat'] = df['days_to_holiday_proximity'] * df['cat_id_enc']
-```
+**Section 2 — Demand Regime Classification (Syntetos-Boylan)**
 
-**Leakage check:** `days_to_closed_holiday` is calendar-derived — no sales
-data in the lookback. Safe at all dates.
-
----
-
-### Fix 2: State-Specific SNAP Cycle Encoding
-**Diagnostic anchor:** Section 9.5. ACF lags 14 and 21 show residual bi-weekly
-autocorrelation (+0.27, +0.18). SHAP direction for `is_snap` is inverted on
-average — the binary flag averages across states with different disbursement
-schedules, producing a mixed signal.
-
-**Keep:** `is_snap` (still useful as a base signal)
-
-**Add:**
-```python
-# SNAP disbursement schedules are publicly documented and fixed across the dataset.
-# CA: 1st–10th of month. TX: varies by last digit of case number (approx 1st–15th).
-# WI: approx 1st–15th of month.
-# Encode day-within-cycle per state — captures within-cycle demand decay.
-
-snap_schedule = {
-    'CA': (1, 10),
-    'TX': (1, 15),
-    'WI': (1, 15),
-}
-
-def snap_day_of_cycle(row):
-    if not row['is_snap']:
-        return 0
-    state = row['state_id']
-    start, end = snap_schedule.get(state, (1, 10))
-    day = row['day_of_month']
-    if start <= day <= end:
-        return day - start + 1
-    return 0
-
-df['snap_day_of_cycle'] = df.apply(snap_day_of_cycle, axis=1)
-
-# Peak window flag — first 3 days of SNAP disbursement per state
-df['is_snap_peak'] = (df['snap_day_of_cycle'] > 0) & (df['snap_day_of_cycle'] <= 3)
-df['is_snap_peak'] = df['is_snap_peak'].astype(int)
-```
-
-**Expected effect:** Corrects SHAP direction for SNAP, eliminates residual
-bi-weekly ACF signal, improves FOODS segment calibration on SNAP days.
-
----
-
-### Fix 3: sell_price Normalization for Elasticity Recovery
-**Diagnostic anchor:** Section 9.5. `sell_price` SHAP pushes demand UP (wrong
-direction). Collinearity with product category — premium HOBBIES SKUs have
-higher prices and lower demand — causes the tree to learn price as a category
-proxy rather than an elasticity signal.
-
-**Keep:** `sell_price` (absolute price still carries signal)
-
-**Add:**
-```python
-# Price relative to each item's own historical mean — isolates promotional
-# signal from category-level price tier.
-# CRITICAL LEAKAGE RULE: item_mean_price is computed from the TRAINING window
-# only and stored as a lookup. It is NOT computed from the full dataset.
-# At inference (both val and Fold 3), the lookup table is joined in — not
-# recomputed from the window being scored.
-
-item_mean_price_lookup = (tr_full
-    .groupby('item_id')['sell_price']
-    .mean()
-    .rename('item_mean_price'))
-item_mean_price_lookup.to_pickle('../data/processed/item_mean_price_lookup.pkl')
-
-# Join onto both train and val
-df = df.merge(item_mean_price_lookup, on='item_id', how='left')
-df['price_vs_item_mean'] = df['sell_price'] / df['item_mean_price'].clip(lower=0.01)
-
-# Rolling 52-week price percentile rank per series
-# Lookback is strictly historical — no leakage
-df['price_percentile_52w'] = (df.groupby('id')['sell_price']
-                                 .transform(lambda x: x.rolling(364, min_periods=28)
-                                 .rank(pct=True)))
-```
-
-**Leakage check:** `item_mean_price_lookup` uses training-period means only.
-`price_percentile_52w` uses a rolling lookback — safe by construction.
-
----
-
-### Section 7 — Feature Distribution Audit (Required Before Training)
-
-Before writing the final parquet files, run the following distribution checks.
-These are engineering sanity checks, not Fold 2 evaluations. Any feature that
-fails these checks is dropped before training begins.
+Compute ADI and CV² for every SKU from the Fold 2 training window
+(Feb 2011 → Jan 2014). These are properties of the historical sales data,
+not of model performance.
 
 ```python
-# For each new feature:
-for col in ['days_to_holiday_proximity', 'preholiday_x_cat',
-            'snap_day_of_cycle', 'is_snap_peak',
-            'price_vs_item_mean', 'price_percentile_52w']:
-    s = df[col]
-    n_null = s.isna().sum()
-    n_inf  = np.isinf(s).sum() if s.dtype != 'object' else 0
-    print(f'{col:<30}  null={n_null:,}  inf={n_inf:,}  '
-          f'min={s.min():.4f}  max={s.max():.4f}  '
-          f'mean={s.mean():.4f}  std={s.std():.4f}')
+def compute_adi(series: pd.Series) -> float:
+    """Average inter-demand interval. Total periods / nonzero periods."""
+    n_total   = len(series)
+    n_nonzero = (series > 0).sum()
+    return n_total / n_nonzero if n_nonzero > 0 else np.inf
+
+def compute_cv2(series: pd.Series) -> float:
+    """CV squared of nonzero demand observations only."""
+    nonzero = series[series > 0]
+    if len(nonzero) < 2:
+        return np.inf
+    return (nonzero.std() / nonzero.mean()) ** 2
+
+def classify_regime(adi: float, cv2: float) -> str:
+    """Syntetos-Boylan (2005) classification."""
+    if adi < 1.32 and cv2 < 0.49:
+        return 'smooth'
+    elif adi < 1.32 and cv2 >= 0.49:
+        return 'erratic'
+    elif adi >= 1.32 and cv2 < 0.49:
+        return 'intermittent'
+    else:
+        return 'lumpy'
 ```
 
-**Pass criteria (all must pass before proceeding):**
-- Null rate < 20% (expected: only `price_percentile_52w` has early-history
-  nulls from the 364-day rolling window; these are acceptable and expected)
-- No infinite values
-- `price_vs_item_mean` mean between 0.90 and 1.10 (near-unity centering confirms
-  the normalization is working; values far from 1.0 indicate a join problem)
-- `snap_day_of_cycle` max ≤ 15 (enforces schedule bounds)
-- `days_to_holiday_proximity` max ≤ 14 (enforces clip logic)
+Thresholds: ADI = 1.32, CV² = 0.49 (Syntetos & Boylan, 2005 — cite this).
 
-Document the output of this cell in the notebook. If any check fails, fix
-the feature before continuing. Do not proceed to 05c until all checks pass.
+**Section 3 — Regime Distribution and Cross-Validation**
 
----
+- How many SKUs in each regime? What % of total revenue per regime?
+- Cross-tabulate regime vs zero-rate bucket from 06b — confirm they align
+- Cross-tabulate regime vs per-SKU WAPE from Section 1 — confirm Smooth
+  SKUs have lower WAPE, Lumpy SKUs have higher WAPE. If this relationship
+  does not hold, investigate before proceeding.
+- Show 3 representative SKUs per regime with their demand pattern plots
 
-### Feature count after v2
-
-| Group | v1 count | v2 count | Change |
-|---|---|---|---|
-| Temporal | 7 | 7 | — |
-| Event/SNAP | 5 | 6 | +`snap_day_of_cycle`, +`is_snap_peak`, −`is_pre_closed_holiday` |
-| Pre-holiday | included above | 2 | +`days_to_holiday_proximity`, +`preholiday_x_cat` |
-| Price | 5 | 7 | +`price_vs_item_mean`, +`price_percentile_52w` |
-| Lag/Rolling | 7 | 7 | — |
-| Hierarchical | 4 | 4 | — |
-| Categoricals | 6 | 6 | — |
-| **Total** | **34** | **39** | **+5** |
-
-### Outputs
-- `features_train_v2.parquet`
-- `features_val_v2.parquet`
-- `feature_cols_v2.pkl`
-- `item_mean_price_lookup.pkl` (training-period means, used at inference)
-
----
-
-## Phase 2 — XGBoost v2 Training and Fold 2 Predictions
-### Notebook: `05c_xgboost_v2.ipynb`
-
-Re-runs the full XGBoost training pipeline on v2 features. Structure mirrors
-`05_xgboost_demand.ipynb` exactly. Same fold boundaries, same evaluation
-functions, same three-tier metric system.
-
-**Why re-run Optuna:** The feature space changed. v1 hyperparameters were
-optimal for 34 features. With 39 features — including two interaction terms
-— the optimal depth, regularization, and column sampling may shift. Running
-Optuna again on Fold 2 with v2 features is correct and not leakage (Fold 3
-is still untouched).
-
----
-
-### Section 1 — Setup
-
-Same constants and eval functions as 05. Add v2 path constants.
-Note explicitly: this notebook uses `features_train_v2.parquet`.
-
----
-
-### Section 2 — Load v2 Features
-
-Load, confirm schema matches `feature_cols_v2.pkl`, run null audit.
-Print feature count delta vs v1 (34 → 39) as a confirmation step.
-
----
-
-### Section 3 — Fold 1 Exploratory Run
-
-Single run with v1 BEST_PARAMS on v2 features to establish a baseline.
-Confirms the new features don't break anything before Optuna runs.
-
----
-
-### Section 4 — Optuna Hyperparameter Search (Fold 2)
-
-Same search space as v1 Optuna. Target: minimize log-RMSE on Fold 2 val.
-Run minimum 50 trials. Freeze best params when convergence is confirmed
-(no improvement in final 20 trials).
-
-Record: v2 BEST_PARAMS block. Note the delta from v1 params — if depth
-or regularization shift substantially, that is evidence the new features
-changed the bias-variance tradeoff as expected.
-
----
-
-### Section 5 — Fold 2 Retrain with Frozen v2 Params
-
-Identical to 05 Section 6. Produces predictions for 05d diagnostics.
-
----
-
-### Section 6 — Apply Post-Hoc Inference Rules and Save Prediction Variants
-
-This section applies the two post-hoc inference rules and saves **three
-separate prediction arrays**. All three are passed to 05d. The decision
-about which variant to use at Fold 3 is made in 05d — not here.
+**Section 4 — Routing Assignment**
 
 ```python
-# ── Prediction variants — save all three ──────────────────────────────────
-
-# Variant A: Raw model output (log space)
-y_pred_raw = model_v2.predict(X_va2)
-
-# ── Variant B: Holiday suppression applied ─────────────────────────────────
-# Hard business rule: stores are closed on these days, sales are impossible.
-# This rule has no performance gate — it is a structural constraint.
-y_pred_suppressed = y_pred_raw.copy()
-closed_mask = va2['is_closed_holiday'].astype(bool)
-y_pred_suppressed[closed_mask] = 0.0
-print(f'Holiday suppression: {closed_mask.sum():,} rows zeroed.')
-
-# ── Variant C: Holiday suppression + isotonic calibration ──────────────────
-# Post-hoc calibration indexed on per-series zero rate.
-# Fit isotonic regression on the zero rate vs mean residual relationship
-# from the Fold 2 TRAINING data. The zero rate is computed from training
-# history; the residuals are from this val window. This is a post-hoc
-# calibration layer — not a model parameter. Labeled explicitly as such.
-#
-# The calibration decision (adopt vs reject) is made in 05d after comparing
-# all three variants. Do NOT make that decision here.
-
-from sklearn.isotonic import IsotonicRegression
-
-# Step 1: Compute per-series zero rate from TRAINING data only
-train_zero_rate = (tr2.groupby('id')['units_sold']
-                      .apply(lambda x: (x == 0).mean())
-                      .rename('zero_rate'))
-
-# Step 2: Compute per-series mean residual on val window (suppressed predictions)
-# Using suppressed variant — calibration is layered on top of suppression
-preds_suppressed_df = va2[['id']].copy()
-preds_suppressed_df['yhat_log']  = y_pred_suppressed
-preds_suppressed_df['true_log']  = y_va2
-preds_suppressed_df['residual']  = y_pred_suppressed - y_va2
-preds_suppressed_df['nonzero']   = y_va2 > 0
-
-series_residuals = (preds_suppressed_df[preds_suppressed_df['nonzero']]
-                    .groupby('id')['residual']
-                    .mean()
-                    .rename('mean_residual'))
-
-# Step 3: Build isotonic regression training set
-# X = zero rate (from training history), y = mean residual (from val)
-# The residual represents how far the model is from zero — the correction
-# needed is the negative of the residual (we want residuals near zero).
-calib_df = train_zero_rate.to_frame().join(series_residuals, how='inner')
-calib_df = calib_df.dropna()
-
-ir = IsotonicRegression(increasing=True, out_of_bounds='clip')
-ir.fit(calib_df['zero_rate'].values, calib_df['mean_residual'].values)
-# Increasing=True enforces the monotone structure from Section 8h:
-# bias worsens (becomes more negative = residual more negative) as zero rate
-# increases. The correction must increase monotonically with zero rate.
-
-# Step 4: Generate per-row corrections
-id_col = va2['id'].values
-zero_rate_per_row = np.array([train_zero_rate.get(i, 0.0) for i in id_col])
-corrections = -ir.predict(zero_rate_per_row)   # negate: residual was pred-true, correction is -(pred-true)
-
-y_pred_calibrated = y_pred_suppressed + corrections
-print(f'Calibration layer: {len(ir.X_thresholds_)} isotonic thresholds.')
-print(f'Correction range: {corrections.min():.4f} to {corrections.max():.4f}')
+def assign_routing(regime: str) -> str:
+    routing = {
+        'smooth':       'tweedie',
+        'erratic':      'tweedie',
+        'intermittent': 'croston',
+        'lumpy':        'tsb_or_policy',
+    }
+    return routing[regime]
 ```
 
-**Save all three variants:**
+**Section 5 — Hysteresis Gate Design**
 
-```python
-# Save predictions for 05d comparison
-predictions_v2 = va2[['id', 'date', 'units_sold']].copy()
-predictions_v2['yhat_raw']        = y_pred_raw
-predictions_v2['yhat_suppressed'] = y_pred_suppressed
-predictions_v2['yhat_calibrated'] = y_pred_calibrated
-predictions_v2['true_log']        = y_va2
-predictions_v2.to_parquet('../data/processed/xgb_v2_predictions_fold2.parquet', index=False)
-
-# Save calibration objects for Fold 3 re-use (method, not values)
-import pickle
-with open('../data/processed/isotonic_calibrator_fold2.pkl', 'wb') as f:
-    pickle.dump(ir, f)
-with open('../data/processed/train_zero_rate_fold2.pkl', 'wb') as f:
-    pickle.dump(train_zero_rate, f)
-
-# Save model and params
-model_v2.save_model('../data/processed/xgb_v2_model_fold2.json')
-with open('../data/processed/xgb_v2_best_params.pkl', 'wb') as f:
-    pickle.dump(BEST_PARAMS_V2, f)
-```
-
-**What is NOT done in this notebook:**
-- No decision about whether calibration is better or worse
-- No metric comparison between variants
-- No approval or rejection of any prediction layer
-- Those decisions belong in 05d
-
----
-
-### Section 7 — Outputs Summary
-
-Print a brief summary confirming all files were written. No analysis.
+Document the hysteresis rule: a SKU reclassifies only if it stays in a new
+regime for 4+ consecutive weekly recomputation cycles. SKUs within 10% of
+either threshold boundary are flagged as "boundary SKUs" in the output.
 
 **Outputs:**
-- `xgb_v2_model_fold2.json`
-- `xgb_v2_predictions_fold2.parquet` (all three variants: raw, suppressed, calibrated)
-- `xgb_v2_best_params.pkl`
-- `isotonic_calibrator_fold2.pkl` (fitted IsotonicRegression object)
-- `train_zero_rate_fold2.pkl` (per-series zero rate lookup from Fold 2 training data)
+- `sku_regimes_fold2.parquet` — SKU, ADI, CV², regime, routing, boundary_flag
+- `regime_thresholds.pkl` — threshold values (1.32, 0.49) for reuse at Fold 3
 
 ---
 
-## Phase 3 — v2 Validation Diagnostics and Calibration Gate
-### Notebook: `05d_validation_diagnostics_v2.ipynb`
+## Phase B — Model Optimization
+### Notebook: `06d_model_optimization.ipynb`
 
-Mirrors `05b` in structure. Evaluates the full v2 pipeline on Fold 2.
-Issues a formal signoff before Fold 3 is opened.
+**Purpose:** Improve Tweedie point forecast accuracy on Smooth and Erratic
+SKUs. Do not attempt to fix Intermittent or Lumpy SKUs here — they are
+handled in Phase D.
 
-This notebook makes two decisions that are locked before Fold 3:
+**All optimization is evaluated on per-SKU weekly WAPE distribution, not
+aggregate metrics. An optimization is only adopted if it improves the
+median per-SKU weekly WAPE without worsening the p90.**
 
-1. Is the v2 pipeline better than v1? (APPROVED or REQUIRES INVESTIGATION)
-2. Is the calibration layer adopted? (ADOPTED or REJECTED)
+**Section 1 — Baseline: Tweedie Suppressed on Smooth + Erratic SKUs Only**
 
-Both decisions are documented in the final cell and are frozen at the time
-the notebook is executed. Neither decision can be revised after Fold 3 results
-are visible.
+Re-evaluate the 06b Tweedie suppressed predictions filtered to Smooth +
+Erratic SKUs only. This is the correct baseline — prior evaluations mixed
+in Intermittent and Lumpy SKUs which dragged aggregate metrics down.
 
----
+Document: median weekly WAPE, p75, p90, % SKUs < 30%, % SKUs < 50%,
+% SKUs > 100% — on Smooth + Erratic SKUs only.
 
-### Primary questions this notebook answers
+**Section 2 — Optimization Option A: Direct Multi-Step Target**
 
-| Question | Where answered |
-|---|---|
-| Does v2 log-RMSE improve on v1 (0.5755)? | Section 4 |
-| Does holiday suppression improve the closed-holiday segment? | Section 4, 6d |
-| Does isotonic calibration improve Fold 2 performance vs suppression-only? | Section 4, 8h |
-| Did pre-holiday feature redesign improve pre-holiday segment? | Section 6d |
-| Did SNAP features correct the SHAP direction failure? | Section 8e |
-| Did price normalization correct sell_price SHAP direction? | Section 8e |
-| Did the bi-weekly ACF signal disappear? | Section 5 |
-| Is Fold 3 leakage still zero? | Section 2 assertion |
+**What it is:** Retrain Tweedie with the 7-day forward sum as the target
+instead of next-day demand. This eliminates error accumulation from
+recursive daily forecasting and directly optimizes the signal used for
+weekly inventory decisions.
 
----
+**Implementation:**
+- Modify feature engineering to produce `target_7d = sum of next 7 days demand`
+- Retrain Tweedie on Fold 2 training data with new target
+- Evaluate per-SKU weekly WAPE on Smooth + Erratic SKUs
 
-### Section 1 — Setup
+**Expected impact:** Should improve weekly WAPE directly since the model
+is now trained on the exact aggregation level used for reorder decisions.
 
-Same constants and eval functions as 05b. Add v2 path constants.
-Load `xgb_v2_predictions_fold2.parquet` — do not retrain in this notebook.
+**Section 3 — Optimization Option B: Asymmetric Loss Function**
 
----
+**What it is:** Replace the symmetric Tweedie loss with a custom objective
+that penalizes underprediction more heavily than overprediction. Directly
+encodes the business reality that stockouts cost more than carrying excess
+inventory.
 
-### Section 2 — Leakage Assertion
+**Implementation:**
 
 ```python
-# Confirm val window dates match expectations
-assert va2['date'].min() == pd.Timestamp('2014-02-01'), 'Val start mismatch'
-assert va2['date'].max() == pd.Timestamp('2015-01-31'), 'Val end mismatch'
-assert va2['date'].max() < pd.Timestamp('2015-02-01'), 'Fold 3 leakage check'
-print('Leakage assertion passed. Fold 3 boundary intact.')
+def asymmetric_loss(y_true, y_pred, alpha=0.6):
+    """
+    alpha > 0.5 penalizes underprediction more than overprediction.
+    alpha = 0.6 means underprediction errors are weighted 1.5× overstock errors.
+    Tune alpha on Fold 2 per-SKU demand ratio distribution.
+    """
+    residual = y_true - y_pred
+    grad = np.where(residual > 0, -2 * alpha * residual,
+                                  -2 * (1 - alpha) * residual)
+    hess = np.where(residual > 0, 2 * alpha,
+                                  2 * (1 - alpha))
+    return grad, hess
 ```
 
----
-
-### Section 3 — Load Predictions and Reconstruct Arrays
-
-Load the three prediction variants from 05c output. Compute all evaluation
-arrays needed for Sections 4–10.
-
-```python
-preds = pd.read_parquet('../data/processed/xgb_v2_predictions_fold2.parquet')
-
-y_true      = preds['true_log'].values
-y_raw       = preds['yhat_raw'].values
-y_supp      = preds['yhat_suppressed'].values
-y_calib     = preds['yhat_calibrated'].values
-```
-
----
-
-### Section 4 — Three-Way Global Performance Comparison
-
-This is the calibration gate. Report all three variants side by side.
-
-```python
-print('=' * 60)
-print('SECTION 4: Three-Way Performance Comparison')
-print('=' * 60)
-
-r_raw   = eval_log_scale(y_true, y_raw,   'Variant A — Raw')
-r_supp  = eval_log_scale(y_true, y_supp,  'Variant B — Holiday Suppressed')
-r_calib = eval_log_scale(y_true, y_calib, 'Variant C — Suppressed + Calibrated')
-```
-
-**Comparison table (populate at runtime):**
-
-| Metric | v1 XGBoost (05b) | v2 Raw | v2 + Holiday Suppressed | v2 + Suppressed + Calibrated |
-|---|---|---|---|---|
-| log-RMSE | 0.5755 | [result] | [result] | [result] |
-| log-MAE | [v1] | [result] | [result] | [result] |
-| Bias | −0.372 | [result] | [result] | [result] |
-| Closed holiday RMSE | 0.655 | [result] | [result] | [result] |
-| Pre-holiday RMSE | 0.598 | [result] | [result] | [result] |
-| Spike RMSE | 1.371 | [result] | [result] | [result] |
-
-**Calibration gate logic (execute in code, not manually):**
-
-```python
-# ── Calibration gate ──────────────────────────────────────────────────────
-# Calibration is adopted only if both conditions are met:
-# 1. Calibrated RMSE is not worse than suppressed RMSE (within tolerance)
-# 2. Calibrated bias magnitude is meaningfully smaller than suppressed bias
-#
-# "Meaningfully smaller" = |bias_calib| < |bias_supp| * 0.80
-# i.e., calibration must reduce bias by at least 20% to pay for its complexity.
-# The 0.80 threshold is conservative by design — calibration must earn adoption.
-
-rmse_tolerance    = 0.010   # calibration may not worsen RMSE by more than 0.010
-bias_reduction_req = 0.80   # calibration must reduce |bias| to below 80% of suppressed
-
-rmse_delta   = r_calib['log_rmse'] - r_supp['log_rmse']
-bias_ratio   = abs(r_calib['bias']) / max(abs(r_supp['bias']), 1e-6)
-
-calibration_passes_rmse  = rmse_delta  <= rmse_tolerance
-calibration_passes_bias  = bias_ratio  <  bias_reduction_req
-
-CALIBRATION_ADOPTED = calibration_passes_rmse and calibration_passes_bias
-
-print()
-print('── Calibration Gate Results ─────────────────────────────')
-print(f'  RMSE delta (calib vs suppressed) : {rmse_delta:+.4f}  '
-      f'(threshold: ≤ +{rmse_tolerance:.3f})  '
-      f'{"✓ PASS" if calibration_passes_rmse else "✗ FAIL"}')
-print(f'  Bias ratio (calib/suppressed)    : {bias_ratio:.4f}  '
-      f'(threshold: < {bias_reduction_req:.2f})  '
-      f'{"✓ PASS" if calibration_passes_bias else "✗ FAIL"}')
-print()
-if CALIBRATION_ADOPTED:
-    print('  ✅ CALIBRATION ADOPTED — Variant C is the approved pipeline.')
-    print('     Fold 3 will use: holiday suppression + isotonic calibration.')
-else:
-    print('  ❌ CALIBRATION REJECTED — Variant B is the approved pipeline.')
-    print('     Fold 3 will use: holiday suppression only.')
-    if not calibration_passes_rmse:
-        print(f'     Rejection reason: RMSE worsened by {rmse_delta:+.4f} — exceeds tolerance.')
-    if not calibration_passes_bias:
-        print(f'     Rejection reason: Bias reduction insufficient ({(1-bias_ratio)*100:.1f}% < 20%).')
-```
-
----
-
-### Sections 5–10 — Diagnostic Battery
-
-Same structure as 05b Sections 5–10, applied to the approved variant (whichever
-was selected by the gate in Section 4). Additionally:
-
-**Section 8h — Bias by Zero Rate (Three-Way):**
-
-```python
-# Plot bias vs zero rate for all three variants on the same chart.
-# The isotonic calibration should flatten the bias-vs-zero-rate curve
-# if it is working. If the curve is not flattened, document why.
-# (Possible reason: the isotonic fit found a different functional form
-# than the bucket method implied, or series zero rate shifted in the
-# val window vs training window.)
-```
-
-**Section 8e — SHAP Direction Audit:**
-
-Repeat the direction audit from 05b Section 8e on the v2 model.
-All five direction checks must pass before the v2 pipeline is approved.
-A direction failure on any feature added in v2 is a sign of a specification
-error, not a tuning target.
-
-```
-Expected direction outcomes:
-  is_snap               → POSITIVE (more SNAP = more demand) — was INVERTED in v1
-  snap_day_of_cycle     → NEGATIVE at higher values (demand decays through cycle)
-  is_snap_peak          → POSITIVE (peak days = highest demand)
-  sell_price            → NEGATIVE (higher price = less demand) — was INVERTED in v1
-  price_vs_item_mean    → NEGATIVE (price above item mean = below normal demand)
-  price_percentile_52w  → NEGATIVE (high price percentile = relatively expensive)
-  days_to_holiday_proximity → POSITIVE (closer to holiday = more demand)
-  preholiday_x_cat      → MIXED acceptable (different categories have different effects)
-  is_closed_holiday     → NEGATIVE (still present but overridden by suppression rule)
-```
-
----
-
-### Section 11 — Fold 2 Signoff and Pipeline Lock
-
-```python
-print('=' * 60)
-print('SECTION 11: FOLD 2 SIGNOFF — v2 PIPELINE')
-print('=' * 60)
-print()
-print('v1 XGBoost baseline log-RMSE:  0.5755')
-print(f'v2 approved pipeline log-RMSE: {r_approved["log_rmse"]:.4f}')
-print(f'Delta:                         {r_approved["log_rmse"] - 0.5755:+.4f}')
-print()
-print(f'CALIBRATION DECISION: {"ADOPTED" if CALIBRATION_ADOPTED else "REJECTED"}')
-print(f'APPROVED PIPELINE VARIANT: {"C (suppressed + calibrated)" if CALIBRATION_ADOPTED else "B (suppressed only)"}')
-print()
-print('This decision is now LOCKED.')
-print('It cannot be changed after Fold 3 results are visible.')
-print()
-
-PIPELINE_APPROVED = r_approved['log_rmse'] <= 0.5755 + 0.010
-# v2 must at minimum not be substantially worse than v1 on RMSE;
-# improvement on bias or segments with the same RMSE is still a net win.
-
-if PIPELINE_APPROVED:
-    print('✅ v2 PIPELINE APPROVED FOR FOLD 3')
-    print('   Notebook 07 may proceed.')
-else:
-    print('⚠  v2 RMSE is worse than v1 by more than 0.010 — INVESTIGATE BEFORE PROCEEDING')
-    print('   Likely cause: one of the new features is adding noise.')
-    print('   Steps: (1) train v2 model with each new feature dropped individually')
-    print('          (2) identify the culprit from SHAP importance')
-    print('          (3) correct or remove the offending feature in 04b')
-    print('   Do not proceed to Fold 3 until approved.')
-```
-
----
-
-### Outputs
-
-No model artifacts — this notebook is a diagnostic only.
-
-Decisions recorded here:
-- `CALIBRATION_ADOPTED` (bool) — documented in final cell
-- `PIPELINE_APPROVED` (bool) — documented in final cell
-- `APPROVED_VARIANT` ('suppressed' or 'calibrated') — documented in final cell
-
-These decisions drive `07_fold3_final_evaluation.ipynb` Section 1.
-
----
-
-## Phase 4 — LightGBM
-### Notebook: `06_lightgbm_demand.ipynb`
-
-Trains LightGBM on v2 features. Same fold structure, same three-tier evaluation.
-Post-hoc inference rules applied identically to XGBoost v2, using the same
-approved pipeline variant determined in 05d.
-
----
-
-### Section 1 — Setup
-
-LightGBM-specific constants. Import `lightgbm as lgb`. Reuse eval functions.
-Load `CALIBRATION_ADOPTED` and `APPROVED_VARIANT` from 05d constants block —
-LightGBM uses the same pipeline decision as XGBoost v2.
-
----
-
-### Section 2 — Load v2 Features
-
-Same parquet files as 05c. Confirm schema.
-
----
-
-### Section 3 — Fold 1 Exploratory Run
-
-Default LightGBM params on v2 features. Establishes a baseline before Optuna.
-
----
-
-### Section 4 — Optuna Hyperparameter Search (Fold 2)
-
-```python
-params = {
-    'num_leaves':        trial.suggest_int('num_leaves', 64, 512),
-    'learning_rate':     trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
-    'feature_fraction':  trial.suggest_float('feature_fraction', 0.5, 1.0),
-    'bagging_fraction':  trial.suggest_float('bagging_fraction', 0.5, 1.0),
-    'bagging_freq':      trial.suggest_int('bagging_freq', 1, 7),
-    'min_child_samples': trial.suggest_int('min_child_samples', 20, 100),
-    'reg_alpha':         trial.suggest_float('reg_alpha', 0.0, 1.0),
-    'reg_lambda':        trial.suggest_float('reg_lambda', 0.0, 1.0),
-    'objective':         'regression',
-    'metric':            'rmse',
-    'verbosity':         -1,
-    'n_estimators':      2000,
-}
-```
-
-Run minimum 50 trials. Freeze best params on convergence.
-
----
-
-### Section 5 — Fold 2 Retrain and Apply Approved Inference Rules
-
-Apply holiday suppression unconditionally. Apply isotonic calibration only
-if `CALIBRATION_ADOPTED = True` from 05d. Use the same `isotonic_calibrator_fold2.pkl`
-and `train_zero_rate_fold2.pkl` from 05c — do not re-fit the calibrator for
-LightGBM. The calibration is a post-model correction indexed on series
-properties, not a model-specific artifact; using the same calibrator ensures
-the XGBoost vs LightGBM comparison is apples-to-apples on pipeline corrections.
-
----
-
-### Section 6 — Fold 2 Performance vs XGBoost v2
-
-Direct comparison table: LightGBM vs XGBoost v2, approved pipeline variant.
-This is the primary output of this notebook. If LightGBM wins on Fold 2,
-it is the primary candidate for the headline Fold 3 result. If XGBoost wins,
-XGBoost is primary. Both proceed to Fold 3.
-
-```
-Fold 2 comparison (v2 features + approved pipeline):
-
-| Metric          | XGBoost v2 | LightGBM  | Winner    |
-|-----------------|------------|-----------|-----------| 
-| log-RMSE        | [05d]      | [result]  |           |
-| log-MAE         | [05d]      | [result]  |           |
-| Bias            | [05d]      | [result]  |           |
-| Closed holiday RMSE | [05d] | [result]  |           |
-| Spike RMSE      | [05d]      | [result]  |           |
-```
-
----
-
-### Section 7 — Winner Selection
-
-Primary criterion: lower log-RMSE on Fold 2. Tie-break (within 0.005):
-lower bias magnitude, then lower closed holiday RMSE.
-
-Document the winner and rationale. This selection is the primary candidate
-but both models produce headline results at Fold 3 — the full comparison
-belongs in the portfolio.
+Tune `alpha` on Fold 2 val. Target: shift median per-SKU demand ratio
+toward 0.90–0.95 without pushing p90 above 1.5.
+
+**Section 4 — Comparison and Selection**
+
+Run both options. Compare against baseline on:
+- Median per-SKU weekly WAPE
+- p90 per-SKU weekly WAPE (tail behavior)
+- Median per-SKU demand ratio
+- % SKUs with demand ratio in 0.8–1.2 band
+
+Select the option that best improves the distribution without degrading the
+tail. If neither clears a 5% improvement in median weekly WAPE, retain the
+06b Tweedie suppressed model as-is and document the result. Do not force an
+improvement that is not there.
 
 **Outputs:**
-- `lgbm_model_fold2.pkl`
-- `lgbm_predictions_fold2.parquet`
-- `lgbm_best_params.pkl`
-- `model_comparison_fold2.csv`
+- `tweedie_optimized_fold2.txt` — winning optimized model
+- `tweedie_optimization_results.pkl` — comparison table for portfolio
 
 ---
 
-## Phase 5 — Final Holdout Evaluation
+## Phase C — Uncertainty Quantification
+### Notebook: `06e_uncertainty_quantification.ipynb`
+
+**Purpose:** Generate calibrated prediction intervals for every Smooth and
+Erratic SKU at multiple service levels. These intervals directly drive
+safety stock calculations in Phase E.
+
+**Section 1 — Conformal Prediction Setup**
+
+Conformal prediction wraps the optimized Tweedie model and produces
+coverage-guaranteed intervals at any service level from a single calibration
+step.
+
+**How it works:**
+
+```python
+# Step 1: Generate predictions on Fold 2 val set
+# (training is already done — this is post-hoc calibration)
+val_preds = optimized_tweedie.predict(X_val_smooth_erratic)
+val_actuals = y_val_smooth_erratic
+
+# Step 2: Compute per-SKU residuals on val set
+residuals_df = pd.DataFrame({
+    'id':       val['id'].values,
+    'residual': val_actuals - val_preds   # actual - predicted
+})
+
+# Step 3: For each SKU, store the empirical residual distribution
+# These ARE the prediction intervals by construction
+sku_residuals = residuals_df.groupby('id')['residual'].apply(list)
+
+# Step 4: At inference, for a new prediction:
+# Lower bound at service level alpha = point_forecast + quantile(residuals, 1-alpha)
+# Upper bound = point_forecast + quantile(residuals, alpha)
+# For inventory we primarily care about the upper bound:
+# reorder_upper_q90 = point_forecast + np.percentile(sku_residuals[sku_id], 90)
+```
+
+**Why this is valid:** The conformal guarantee holds as long as the
+calibration residuals are exchangeable with the production residuals — i.e.,
+that Fold 2 val demand patterns are representative of future demand patterns.
+This is the same assumption the model itself makes. No additional assumptions
+are required.
+
+**Section 2 — Coverage Validation**
+
+This is the critical validation step. For each service level, verify that
+empirical coverage matches the target on the Fold 2 val set.
+
+```
+Coverage Validation — Fold 2 Val (Smooth + Erratic SKUs):
+
+Service level  Target coverage  Empirical coverage  Pass/Fail
+q50            50%              [result]%           [P/F]
+q75            75%              [result]%           [P/F]
+q80            80%              [result]%           [P/F]
+q90            90%              [result]%           [P/F]
+q95            95%              [result]%           [P/F]
+q99            99%              [result]%           [P/F]
+
+Pass threshold: within ±3 percentage points of target.
+```
+
+If coverage fails at any level, investigate whether it is a global bias
+(all SKUs off) or concentrated in specific regimes. Do not proceed to
+Phase E until coverage passes.
+
+**Section 3 — Per-SKU Interval Width Analysis**
+
+- Distribution of interval widths at q90 across all Smooth + Erratic SKUs
+- Interval width vs zero rate scatter — confirm intervals widen for sparser SKUs
+- Interval width vs mean demand scatter — confirm intervals are proportional
+- Flag SKUs where q90 interval width > 3× mean demand (extreme uncertainty —
+  these are borderline Intermittent and may need rerouting)
+
+**Section 4 — Service Level Selection by Regime**
+
+Document the recommended default service level per regime:
+
+| Regime | Default service level | Rationale |
+|---|---|---|
+| Smooth | q80 | Low forecast error, moderate buffer sufficient |
+| Erratic | q90 | High demand variance, wider buffer needed |
+| Intermittent | Croston native | No conformal — see Phase D |
+| Lumpy | Policy-based | No conformal — see Phase D |
+
+These are defaults. The app allows override per SKU.
+
+**Outputs:**
+- `conformal_residuals_fold2.pkl` — per-SKU residual distributions
+- `coverage_validation_fold2.csv` — coverage table for portfolio
+
+---
+
+## Phase D — Intermittent Demand Handling
+### Notebook: `06f_intermittent_demand.ipynb`
+
+**Purpose:** Provide principled forecasts for Intermittent and Lumpy SKUs
+that the global Tweedie model cannot handle. Do not apply ML where the
+signal does not support it.
+
+**Section 1 — Croston's Method for Intermittent SKUs**
+
+Croston's method separates demand into two components:
+- **Demand size:** exponential smoothing on the magnitude of demand when it
+  occurs (nonzero observations only)
+- **Demand interval:** exponential smoothing on the number of periods between
+  demand events
+
+Point forecast = smoothed demand size ÷ smoothed demand interval.
+This gives "expected demand per period" accounting for the intermittent pattern.
+
+**TSB variant (Terence-Syntetos-Boylan):** Improves on original Croston by
+letting demand probability decay when no demand is observed. Better for SKUs
+that may be dying or seasonal. Use TSB as default.
+
+```python
+def tsb_forecast(demand: np.ndarray, alpha: float = 0.1,
+                 beta: float = 0.1) -> float:
+    """
+    TSB forecast for intermittent demand.
+    alpha: smoothing for demand probability
+    beta:  smoothing for demand size
+    Returns: expected demand per period
+    """
+    p = (demand > 0).mean()   # initialize demand probability
+    z = demand[demand > 0].mean() if (demand > 0).any() else 0.0
+    for d in demand:
+        if d > 0:
+            p = (1 - alpha) * p + alpha * 1.0
+            z = (1 - beta)  * z + beta  * d
+        else:
+            p = (1 - alpha) * p
+    return p * z
+```
+
+Tune alpha and beta on Fold 2 training data per SKU via grid search.
+Evaluate on Fold 2 val: per-SKU weekly WAPE on Intermittent SKUs.
+
+**Section 2 — Historical Policy for Lumpy SKUs**
+
+Truly unforecastable SKUs (Lumpy regime: high ADI, high CV²) should not
+receive an ML or statistical forecast. The correct approach is a min-max
+inventory policy driven by historical demand.
+
+```python
+def historical_policy_forecast(train_demand: pd.Series,
+                                lead_time_weeks: int = 1,
+                                buffer_multiplier: float = 1.25) -> dict:
+    """
+    Min-max reorder policy for Lumpy SKUs.
+    Reorder point: max weekly demand in same calendar period last year × buffer
+    Order quantity: bring inventory up to max observed weekly demand × buffer
+    """
+    weekly_demand = train_demand.resample('W').sum()
+    max_weekly    = weekly_demand.max()
+    avg_weekly    = weekly_demand.mean()
+    reorder_point = max_weekly * lead_time_weeks * buffer_multiplier
+    order_qty     = max_weekly * buffer_multiplier - avg_weekly
+    return {
+        'reorder_point': reorder_point,
+        'order_qty':     max(order_qty, avg_weekly),
+        'max_weekly':    max_weekly,
+        'avg_weekly':    avg_weekly,
+    }
+```
+
+**Section 3 — Evaluation: Croston vs Tweedie on Intermittent SKUs**
+
+Direct comparison on the Fold 2 val set for Intermittent SKUs only:
+- Per-SKU weekly WAPE: Croston/TSB vs Tweedie suppressed
+- Demand ratio: Croston/TSB vs Tweedie suppressed
+- Show that Croston/TSB improves over the global model on this segment
+
+This is a key portfolio moment — demonstrating that you know when not to
+use ML and apply a domain-appropriate method instead.
+
+**Section 4 — Unified Prediction Output**
+
+Combine all routing paths into a single predictions dataframe:
+
+```python
+# final_predictions_fold2.parquet schema:
+# id | date | regime | routing | point_forecast |
+# q50 | q75 | q80 | q90 | q95 | q99 |
+# interval_source ('conformal' / 'croston_native' / 'policy')
+```
+
+For Croston SKUs: q50 = TSB point forecast; q90 = point forecast +
+2× std of nonzero demand observations.
+For Lumpy SKUs: all quantiles = historical policy reorder point.
+
+**Outputs:**
+- `croston_predictions_fold2.parquet`
+- `final_predictions_fold2.parquet` — unified, all SKUs, all service levels
+
+---
+
+## Phase E — Inventory Simulation
+### Notebook: `06g_inventory_simulation.ipynb`
+
+**Purpose:** Convert forecasts → reorder decisions → simulate business
+outcomes on the Fold 2 val window. Produce the headline business metrics
+that anchor the portfolio narrative.
+
+**Section 1 — Reorder Parameter Computation**
+
+For each SKU, compute reorder parameters from the unified predictions:
+
+```python
+def compute_reorder_params(sku_id: str,
+                            point_forecast_weekly: float,
+                            q90_upper: float,
+                            lead_time_weeks: int,
+                            service_level: float) -> dict:
+    """
+    Compute reorder point and safety stock for a single SKU.
+
+    safety_stock  = (q_upper - point_forecast) × sqrt(lead_time)
+                  = interval half-width scaled by lead time uncertainty
+    reorder_point = point_forecast × lead_time + safety_stock
+    reorder_qty   = reorder_point - current_inventory (when triggered)
+    """
+    interval_width = q90_upper - point_forecast_weekly
+    safety_stock   = interval_width * np.sqrt(lead_time_weeks)
+    reorder_point  = point_forecast_weekly * lead_time_weeks + safety_stock
+    return {
+        'sku_id':         sku_id,
+        'point_forecast': point_forecast_weekly,
+        'safety_stock':   safety_stock,
+        'reorder_point':  reorder_point,
+        'service_level':  service_level,
+    }
+```
+
+**Section 2 — Inventory Depletion Simulation**
+
+Simulate week-by-week inventory depletion on the Fold 2 val window
+(Feb 2014 → Jan 2015) using actual sales as ground truth.
+
+```python
+def simulate_inventory(actual_weekly_demand: np.ndarray,
+                        reorder_point: float,
+                        reorder_qty: float,
+                        initial_inventory: float,
+                        lead_time_weeks: int) -> dict:
+    """
+    Simulate inventory trajectory under the reorder policy.
+    Returns stockout weeks, average inventory, service level achieved.
+    """
+    inventory     = initial_inventory
+    stockout_weeks = 0
+    inventory_history = []
+    pending_order = 0
+    weeks_until_arrival = 0
+
+    for week, demand in enumerate(actual_weekly_demand):
+        # Receive order if due
+        if weeks_until_arrival == 0 and pending_order > 0:
+            inventory += pending_order
+            pending_order = 0
+
+        # Fulfill demand
+        fulfilled = min(inventory, demand)
+        if demand > inventory:
+            stockout_weeks += 1
+        inventory -= fulfilled
+
+        # Place reorder if below reorder point
+        if inventory <= reorder_point and pending_order == 0:
+            pending_order       = reorder_qty
+            weeks_until_arrival = lead_time_weeks
+
+        inventory_history.append(inventory)
+        if weeks_until_arrival > 0:
+            weeks_until_arrival -= 1
+
+    return {
+        'stockout_rate':     stockout_weeks / len(actual_weekly_demand),
+        'avg_inventory':     np.mean(inventory_history),
+        'fill_rate':         1 - stockout_weeks / len(actual_weekly_demand),
+        'inventory_history': inventory_history,
+    }
+```
+
+**Section 3 — Simulate at All Service Levels**
+
+Run the simulation at q50, q75, q80, q90, q95 for all SKUs.
+Aggregate results by regime and service level:
+
+```
+Simulation Results — Fold 2 Val (52 weeks, all SKUs):
+
+Service level   Stockout rate   Avg inventory   Fill rate
+q50             [result]%       [result] units  [result]%
+q75             [result]%       [result] units  [result]%
+q80             [result]%       [result] units  [result]%
+q90             [result]%       [result] units  [result]%
+q95             [result]%       [result] units  [result]%
+
+Naive reorder   [result]%       [result] units  [result]%
+(reorder on mean historical demand — no forecast)
+```
+
+**This table is the headline result of the entire project.**
+
+**Section 4 — Cost Tradeoff Curve**
+
+Plot: as service level increases from q50 to q99, overstock cost increases
+and stockout cost decreases. Find and annotate the crossover point — the
+service level at which total inventory cost is minimized.
+
+Cost parameters (locked for reporting — configurable in app):
+- Median unit cost: $4.00 (M5 dataset approximate)
+- Stockout cost: 2× unit cost per unit short ($8.00) — represents lost sale
+  plus estimated customer churn penalty
+- Carrying cost: 25% of unit cost per year ($1.00/unit/year) — standard
+  retail holding cost assumption
+
+From these, compute and report in the notebook summary cell:
+
+  total_stockout_cost   = stockout_units × $8.00
+  total_carrying_cost   = avg_inventory_units × $1.00
+  total_inventory_cost  = total_stockout_cost + total_carrying_cost
+
+Report the dollar figures at q80 vs naive baseline. This is the headline
+business number for the README and every interview: "At q80 service level,
+the system reduces total inventory cost by approximately $X vs naive reorder
+on the Fold 2 validation window."
+
+**Section 5 — Simulation by SKU Regime**
+
+Break out simulation results by regime (Smooth, Erratic, Intermittent,
+Lumpy). Confirm:
+- Smooth SKUs achieve high fill rates at low service levels (model is accurate)
+- Lumpy SKUs require high service levels or policy-based buffers to achieve
+  acceptable fill rates
+
+**Outputs:**
+- `reorder_parameters_fold2.parquet`
+- `simulation_results_fold2.parquet`
+- Headline numbers locked for README and app
+
+---
+
+## Phase F — Fold 3 Final Production Simulation
 ### Notebook: `07_fold3_final_evaluation.ipynb`
 
-**This notebook is run exactly once. Results are never used to make any
-modeling decision. The moment Fold 3 results are visible, the pipeline
-is locked.**
+**This notebook is run exactly once. It is never rerun. The moment Fold 3
+results are visible, the pipeline is locked regardless of what they show.**
 
-Both models are evaluated under identical conditions. The approved pipeline
-(suppressed-only or suppressed-plus-calibrated) is applied identically to both,
-as determined by the `CALIBRATION_ADOPTED` flag locked in 05d.
+Fold 3 is not a model tuning step. It is a production simulation: does the
+full pipeline — routing, forecasting, uncertainty quantification, and
+inventory simulation — behave consistently on unseen data?
 
----
+**Section 1 — Pre-Flight Checklist**
 
-### Section 1 — Setup and Pre-Flight Checklist
-
-Before running any cells, confirm in writing:
+All of the following must be confirmed before any cells execute:
 
 ```python
-# ── PIPELINE DECISION CONSTANTS (copy from 05d Section 11) ──────────────
-# These values are locked. Do not change them after seeing Fold 3 results.
-CALIBRATION_ADOPTED = [True / False]   # copy exact value from 05d
-APPROVED_VARIANT    = ['calibrated' / 'suppressed']  # copy exact value from 05d
-```
+# ── Locked decisions from pre-Fold 3 work ─────────────────────────────────
+PRODUCTION_MODEL    = 'tweedie_optimized'  # from 06d
+OPTIMIZATION_METHOD = '[direct_multistep or asymmetric_loss]'  # from 06d
+REGIME_THRESHOLDS   = {'adi': 1.32, 'cv2': 0.49}  # locked in 06c
+CONFORMAL_ALPHA     = [value locked in 06e]
+HYSTERESIS_WEEKS    = 4
 
-Pre-flight checklist (must be confirmed by comment in the notebook before
-any cells below are executed):
-
-```
-# Pre-flight checklist:
-# [ ] features_val_v2.parquet loaded (not features_train)
-# [ ] BEST_PARAMS for both models loaded from pkl files — not typed manually
-# [ ] item_mean_price_lookup.pkl loaded (for price_vs_item_mean at inference)
-# [ ] CALIBRATION_ADOPTED copied exactly from 05d Section 11 output
-# [ ] Fold 3 val window: Feb 2015 → Jan 2016
-# [ ] Leakage assertion will run before any metric is computed
-# [ ] If CALIBRATION_ADOPTED=True: isotonic calibrator will be RE-FIT from
-#     Fold 3 training data (not from 05c pkl file — that was Fold 2 training
-#     data and the Fold 3 training window is one year longer)
-```
-
----
-
-### Section 2 — Load Fold 3 Data
-
-Load `features_val_v2.parquet`. This is the first time this file is opened.
-
-```python
-# Leakage assertion — must pass before any metric computation
+# Pre-flight assertions
 assert fold3_val['date'].min() == pd.Timestamp('2015-02-01'), 'Fold 3 start mismatch'
-assert fold3_train['date'].max() < pd.Timestamp('2015-02-01'), 'Leakage: train overlaps Fold 3 val'
-print('Fold 3 leakage assertion passed.')
+assert fold3_train['date'].max() < pd.Timestamp('2015-02-01'), 'Leakage detected'
+print('Pre-flight assertions passed.')
 ```
 
----
+**Section 2 — Demand Regime Classification on Fold 3 Training Data**
 
-### Section 3 — Retrain Both Models on Full Fold 3 Training Data
+Recompute ADI and CV² from Fold 3 training window (Feb 2011 → Jan 2015).
+The method is identical to 06c — the values are recomputed from the longer
+training window, not copied from 06c.
 
-Train XGBoost v2 and LightGBM on Feb 2011 → Jan 2015.
-Monitor set: last 60 days (Dec 2014 → Jan 2015).
-Apply frozen params — no Optuna, no adjustments.
+Compare regime distribution: Fold 2 vs Fold 3. Flag SKUs that reclassified.
+Apply hysteresis gate. Document stability.
 
----
+**Section 3 — Retrain Production Model on Fold 3 Training Data**
 
-### Section 4 — Apply Approved Inference Rules
+Retrain the optimized Tweedie model on the full Fold 3 training window
+using frozen params from 06d. No Optuna, no adjustments.
 
-```python
-# ── Holiday suppression — always applied ──────────────────────────────────
-# No gate. Stores are closed. Business constraint.
-closed_mask = fold3_val['is_closed_holiday'].astype(bool)
-y_xgb[closed_mask]  = 0.0
-y_lgbm[closed_mask] = 0.0
-print(f'Holiday suppression: {closed_mask.sum():,} rows zeroed.')
+**Section 4 — Conformal Calibration on Fold 3**
 
-# ── Isotonic calibration — applied only if adopted in 05d ─────────────────
-if CALIBRATION_ADOPTED:
-    # Re-fit isotonic regression from Fold 3 training data
-    # The method is the same as 05c; the training window is longer.
-    # Zero rate is recomputed from the full Fold 3 training history.
-    fold3_train_zero_rate = (fold3_train.groupby('id')['units_sold']
-                                        .apply(lambda x: (x == 0).mean())
-                                        .rename('zero_rate'))
+Refit conformal residuals from Fold 3 training in-sample predictions.
+The method is identical to 06e. The residual distribution is recomputed —
+not copied from 06e pkl files.
 
-    # Residuals for fitting: use XGBoost's Fold 3 training residuals
-    # (in-sample, from the retrained model above) as a proxy for the
-    # calibration curve — this is the only in-sample quantity available
-    # for isotonic fitting since we have not yet seen Fold 3 val targets.
-    #
-    # IMPORTANT: This uses in-sample training residuals, not val residuals.
-    # This is correct because val targets are not yet visible. The resulting
-    # calibration will be noisier than the 05c version (which used val residuals)
-    # but remains unbiased with respect to Fold 3 val.
-    fold3_train_preds = model_xgb_f3.predict(X_fold3_train)
-    fold3_train_resid = y_fold3_train - fold3_train_preds
-    fold3_series_resid = (pd.DataFrame({'id': fold3_train['id'],
-                                        'residual': fold3_train_resid})
-                            .groupby('id')['residual'].mean())
-    calib_df_f3 = fold3_train_zero_rate.to_frame().join(fold3_series_resid, how='inner').dropna()
+**Section 5 — Run Full Pipeline**
 
-    ir_f3 = IsotonicRegression(increasing=True, out_of_bounds='clip')
-    ir_f3.fit(calib_df_f3['zero_rate'].values, calib_df_f3['residual'].values)
+Apply complete pipeline to Fold 3 val:
+1. Route each SKU by Fold 3 regime classification
+2. Apply optimized Tweedie (Smooth/Erratic) or Croston/TSB (Intermittent/Lumpy)
+3. Apply conformal intervals to Tweedie predictions
+4. Run inventory simulation at q80 and q90
 
-    val_id_col = fold3_val['id'].values
-    zr_val = np.array([fold3_train_zero_rate.get(i, 0.0) for i in val_id_col])
-    corrections_f3 = -ir_f3.predict(zr_val)
-
-    y_xgb  = y_xgb  + corrections_f3
-    y_lgbm = y_lgbm + corrections_f3
-    print(f'Fold 3 isotonic calibration applied. '
-          f'Correction range: {corrections_f3.min():.4f} to {corrections_f3.max():.4f}')
-else:
-    print('Calibration not applied (CALIBRATION_ADOPTED=False from 05d).')
-```
-
-**Note on the in-sample calibration design at Fold 3:** The 05c calibration
-used val residuals to fit the isotonic curve, which was possible because the
-val window was used for diagnostic purposes. At Fold 3, the val targets cannot
-be used — only training residuals are available. The in-sample residuals
-capture the same zero-rate vs underprediction structure (since the structure
-is driven by training dynamics, not val-specific effects) but are less precise.
-This is the correct behavior. Document this distinction explicitly in the
-notebook.
-
----
-
-### Section 5 — Tier 2 Performance: Both Models
-
-Global log-RMSE, log-MAE, bias for XGBoost v2 and LightGBM.
-v1 XGBoost Fold 2 result shown for context (not a direct comparison since
-it is from a different fold, but useful for orientation).
+**Section 6 — Evaluate Against Fold 2 Benchmarks**
 
 ```
-Final Fold 3 Results:
+Fold 3 vs Fold 2 Stability Check:
 
-| Metric    | XGBoost v1 (Fold 2 proxy) | XGBoost v2 | LightGBM | Winner |
-|-----------|-----------------------|------------|----------|--------|
-| log-RMSE  | 0.5755                | [result]   | [result] |        |
-| log-MAE   | —                     | [result]   | [result] |        |
-| Bias      | −0.372                | [result]   | [result] |        |
+Metric                          Fold 2      Fold 3      Stable?
+Regime distribution (% Smooth)  [F2]%       [F3]%       ±5% = stable
+Median per-SKU weekly WAPE      [F2]%       [F3]%       ±5% = stable
+p90 per-SKU weekly WAPE         [F2]%       [F3]%       ±10% = stable
+q90 empirical coverage          [F2]%       [F3]%       ±3pp = stable
+Simulated stockout rate (q80)   [F2]%       [F3]%       ±5pp = stable
+Simulated fill rate (q80)       [F2]%       [F3]%       ±5pp = stable
 ```
 
----
+**Section 7 — Final Headline Numbers**
 
-### Section 6 — Tier 3 Signal Ceiling Comparison
+State the production system's performance in business terms:
 
-MAPE on representative series (FOODS_3_163_CA_3), monthly, non-zero months.
-Compared directly against SARIMA (22.22%) and Prophet (24.25%).
+- At q80 service level and 7-day lead time, simulated fill rate on
+  Fold 3 holdout: X%
+- Vs naive reorder baseline: Y% fill rate at equivalent inventory level
+- % of SKUs forecast within 30% weekly error (forecastable SKUs)
+- % improvement over SARIMA/Prophet on representative series
 
-```
-Signal Ceiling Results (Tier 3 — representative series, monthly):
+**Section 8 — Fold 3 Signoff**
 
-| Model     | Overall MAPE | Apr 2015 | May 2015 | Jan 2016 |
-|-----------|-------------|----------|----------|----------|
-| Naive     | 55.29%      | —        | —        | —        |
-| SARIMA    | 22.22%      | [error]  | [error]  | [error]  |
-| Prophet   | 24.25%      | [error]  | [error]  | [error]  |
-| XGBoost v2| [result]    | [result] | [result] | [result] |
-| LightGBM  | [result]    | [result] | [result] | [result] |
-```
-
----
-
-### Section 7 — Tier 4 Quantile Calibration
-
-Empirical coverage for q50, q80, q95, q99 on Fold 3 val window.
-Both models evaluated. A model is calibrated if empirical coverage
-is within ±3 percentage points of the target quantile.
-
----
-
-### Section 8 — Segmented Analysis (Abbreviated)
-
-Key segments only:
-- By department (confirm HOBBIES_2 still worst, FOODS_3 still best)
-- By demand bucket (confirm bias-volume relationship persists or is corrected)
-- Closed holiday rows (confirm suppression rule zeroed them)
-- Signal ceiling months specifically
-
----
-
-### Section 9 — Final Model Selection
-
-Document the winning model with explicit quantitative reasoning.
-This is the model used in the Streamlit app and cited in the README.
-
----
-
-### Section 10 — Fold 3 Signoff
-
-One paragraph. State the final numbers. State the winner. State what
-the portfolio claims. Lock the notebook.
+One paragraph. State the numbers. State that the pipeline is locked.
+This notebook is never run again.
 
 **Outputs:**
-- `xgb_v2_model_fold3.json`
-- `lgbm_model_fold3.pkl`
-- `xgb_v2_predictions_fold3.parquet`
-- `lgbm_predictions_fold3.parquet`
-- `final_model_comparison.csv`
-- `isotonic_calibrator_fold3.pkl` (if calibration adopted — re-fitted from Fold 3 training)
-- `zero_rate_lookup_fold3.pkl`
+- `tweedie_optimized_fold3.txt`
+- `sku_regimes_fold3.parquet`
+- `conformal_residuals_fold3.pkl`
+- `final_predictions_fold3.parquet`
+- `simulation_results_fold3.parquet`
 
 ---
 
-## Phase 6 — Explainability
+## Phase G — Explainability
 ### Notebook: `08_explainability.ipynb`
 
-Uses the winning model's Fold 3 predictions and the full training data.
-SHAP analysis now reflects the v2 feature set — compare directly against
-05b Section 8e to confirm direction failures were corrected.
+Uses the optimized Tweedie model from Fold 3.
 
 **Section 1 — SHAP Global Importance**
 
-- Reproduce 05b Section 8e on winning model + v2 features
-- Confirm all direction checks pass (see the 05d Section 8e checklist above)
-- Show v1 vs v2 SHAP rank comparison table
+SHAP on the final production Tweedie model. Does feature ranking make
+business sense? Compare against 05b v1 feature importance — document
+which features improved in rank due to v2 engineering.
 
-**Section 2 — SHAP Direction Validation**
+**Section 2 — SHAP by Demand Regime**
 
-Same direction check table as 05b 8e. All checks should now pass.
+This is the key insight for the portfolio: different SKU types are
+driven by different features. Run SHAP separately per regime:
 
-**Section 3 — Per-SKU Waterfall Plots**
+- Smooth SKUs: likely dominated by price and recent lag features
+- Erratic SKUs: likely dominated by promotional/calendar features
+- Intermittent SKUs: likely dominated by seasonality and event proximity
 
-Three representative series:
-- FOODS_3_163_CA_3 (benchmark series)
-- HOBBIES_1_408_CA_2 (worst series from 05b 8h)
-- One SNAP-heavy FOODS series during a SNAP peak week
+Showing this explicitly demonstrates you understand the demand drivers
+change by SKU type — not just a global importance bar chart.
 
-**Section 4 — Anomaly Detection**
+**Section 3 — Feature Stability Across Departments**
 
-- Residuals from Fold 3 predictions
+Are the top 5 SHAP features consistent across FOODS, HOBBIES, HOUSEHOLD?
+If a feature ranks #1 globally but #8 in HOBBIES, that is worth noting.
+
+**Section 4 — Per-SKU Waterfall Plots**
+
+Three representative SKUs — one per forecastable regime:
+- FOODS_3_163_CA_3 (Smooth — benchmark series)
+- One Erratic SKU (high-volume, volatile demand)
+- One Intermittent SKU (for contrast — show Croston output vs Tweedie)
+
+**Section 5 — Anomaly Detection on Fold 3 Residuals**
+
 - Z-score flags: demand spikes (z > 3), suppressed demand (z < −3)
-- Isolation Forest on residual distribution
-- Flag the 3,937 anomalous `price_change_pct_raw` rows from feature engineering
+- Flag SKUs with persistent residual bias (systematic over or under
+  in a specific month) — these are candidates for regime reclassification
+  in a production monitoring system
 
 ---
 
-## Calibration Design Appendix
+## Phase H — App Data Preparation
+### Notebook: `09_app_data_prep.ipynb`
 
-This section is a reference for why the isotonic regression method was
-chosen over alternatives. It is included in the plan for portfolio
-transparency.
+Pre-compute everything the app needs. The app does zero model inference
+at runtime — all forecasts and simulations are precomputed and stored as
+parquet.
 
-### Option A — Fixed Bucket Corrections (Original Plan)
-**Statistical weaknesses:** Arbitrary bin boundaries create discontinuities
-that are indefensible in a production review. Mean residual per bucket
-is not an optimal estimator of the correction needed. The step function
-discards gradient information that the Section 8h scatter confirms is present.
-**Status: Replaced.**
+**Outputs to precompute:**
+- Fold 3 predictions for all SKUs at all service levels (q50/q75/q80/q90/q95/q99)
+- Reorder parameters per SKU at 7-day and 14-day lead times
+- Simulation results per SKU (stockout rate, fill rate, avg inventory)
+- SHAP values per SKU (top 5 features + values for waterfall)
+- Regime classification per SKU
+- SKU metadata (department, store, category, mean demand, zero rate)
 
-### Option B — Linear Regression on Zero Rate
-**Properties:** OLS fit on (zero_rate, mean_residual) pairs. Simple, interpretable,
-no boundary artifacts. Assumes linearity.
-**Weakness:** Zero rate vs bias relationship may plateau above 80% (log-space
-floor effect). A forced linear fit at high zero rates may overcorrect.
-**Status: Acceptable fallback if isotonic regression fails the gate in 05d.**
-If `IsotonicRegression` from sklearn is unavailable in the execution
-environment, replace with `np.polyfit(degree=1)` and document the change.
+Load time target: app loads in < 3 seconds. All heavy computation happens here.
 
-### Option C — Isotonic Regression on Zero Rate (Adopted)
-**Properties:** Non-parametric monotone fit. No assumed functional form.
-Enforces the monotone constraint that is theoretically required (bias must
-not improve as zero rate increases — the Section 8h r=−0.912 confirms this).
-No boundary artifacts. As many degrees of freedom as the data supports.
-**Weakness:** Slightly less interpretable than a linear fit for a portfolio
-conversation. Mitigated by the fact that "monotone regression" is a
-one-sentence explanation.
-**Status: Adopted.**
+---
 
-### Option D — Two-Stage Model (Classify then Regress)
-**Properties:** Separate binary classifier predicts P(demand > 0); separate
-regressor predicts E[demand | demand > 0]. Final forecast = P(>0) × E[demand|>0].
-Directly addresses zero-inflation as an architectural decision rather than a
-post-hoc correction.
-**Weakness:** Significant scope increase. Requires a new training objective,
-a blending weight, and a separate validation framework.
-**Status: Backlog — correct long-run solution, out of scope for this sprint.**
+## Deployment Layer — Streamlit App (`app.py`)
 
-### What "not automatically accepted" means in practice
-A production ML team treats calibration as a pipeline stage with its own
-evaluation criteria, not a free improvement. The gate in 05d Section 4
-enforces this: calibration must reduce bias by at least 20% (relative)
-without worsening RMSE by more than 0.010. If it does not pass, the simpler
-pipeline (suppression only) is used. Hiring managers reading this portfolio
-will see that the practitioner distinguishes between "we tried this" and
-"this earned its place in the pipeline" — that distinction is the mark of
-production-aware ML work.
+Five pages. Any SKU selectable on any page. All data precomputed.
+
+---
+
+### Page 1 — SKU Inventory Dashboard
+
+The primary page. Answers: "What should I do about this SKU right now?"
+
+**Inputs (sidebar):**
+- Store / SKU selector (any individual `item_id × store_id`)
+- Current inventory level (units)
+- Supplier lead time (7 days default, configurable)
+- Target service level (80% / 90% / 95% / 99%)
+
+**Outputs:**
+- 28-day demand forecast chart with selected service level band
+- Regime badge (Smooth / Erratic / Intermittent / Lumpy)
+- Forecast confidence score (derived from interval width ÷ mean demand —
+  high = narrow intervals = confident, low = wide intervals = uncertain)
+- Reorder recommendation: quantity and timing
+- Projected stockout date at current inventory level
+- Safety stock suggestion for selected service level
+- If Intermittent/Lumpy: "This SKU uses [Croston/policy]-based forecasting.
+  The model-based approach is not reliable for this demand pattern."
+
+**Aggregation support:**
+Filter to store, department, category, or state level for planning views.
+Point forecasts aggregate by sum. Quantile bands at aggregate levels are
+labeled "indicative" — summing q90 across SKUs overstates aggregate q90
+due to demand diversification.
+
+---
+
+### Page 2 — Portfolio Risk Monitor
+
+Answers: "Which SKUs need attention this week?"
+
+- Full SKU table: forecast, demand ratio, regime, WAPE tier, stockout risk flag
+- Filterable by store, department, regime, risk level
+- Red highlight: SKUs projected to stockout within lead time at current
+  inventory
+- Yellow highlight: SKUs with recent forecast error spike (rolling WAPE
+  increased > 20% last 4 weeks)
+- Regime change alerts: SKUs that reclassified in the most recent window
+
+---
+
+### Page 3 — Backtesting and Simulation Results
+
+Answers: "Why should I trust this system?"
+
+- Walk-forward CV results table (all models: Naive, SARIMA, Prophet,
+  XGBoost v1, LightGBM Tweedie)
+- Fold 3 inventory simulation results: fill rate and stockout rate at each
+  service level, vs naive reorder baseline
+- Cost tradeoff curve: total inventory cost vs service level
+- Coverage validation table: does q90 actually cover 90%?
+
+---
+
+### Page 4 — Explainability Engine
+
+Answers: "Why is the model forecasting this?"
+
+- Global SHAP feature importance bar chart
+- Per-SKU SHAP waterfall (linked to SKU selector — same SKU as Page 1)
+- Top 3 demand drivers in plain English for selected SKU:
+  "Demand for this SKU is primarily driven by: recent sales trend (+),
+  day of week (Fridays peak), proximity to SNAP payment dates (+)"
+- Price elasticity visualization for selected product-store combination
+
+---
+
+### Page 5 — Technical Deep Dive
+
+For the technical interviewer.
+
+- Full metric tables: per-fold log-RMSE, WAPE, bias by model
+- Quantile calibration summary: empirical vs target coverage per level
+- Per-SKU WAPE distribution histograms by regime
+- Error distributions by department and store
+- SHAP feature importance by regime (from 08)
+- Methodology note on conformal prediction and Syntetos-Boylan classification
+
+---
+
+## Production System Design (README Section)
+
+*Demonstrates understanding of real-world ML systems.*
+
+### Retraining Pipeline
+- Weekly recompute: ADI + CV² per SKU from expanding training window
+- Regime reclassification with 4-week hysteresis gate
+- Monthly model retrain on expanding window (frozen hyperparams)
+- Conformal residuals refit from most recent N weeks of production data
+
+### Monitoring
+- Rolling per-SKU WAPE tracked weekly — alert if p90 drifts > 10%
+- Quantile coverage monitoring — alert if q90 drops below 85%
+- Regime change detection — flag SKUs transitioning regimes
+- Demand spike detection via residual z-scores
+
+### Inference
+- Batch forecasting at 7, 28, 90-day horizons
+- All predictions stored as parquet for downstream consumption
+- Zero model inference at query time
 
 ---
 
 ## Execution Order and Time Estimates
 
-| Step | Notebook | Estimated time | Blocking dependency |
+| Step | Notebook | Est. time | Blocking dependency |
 |---|---|---|---|
-| 1 | `04b_feature_engineering_v2.ipynb` | 2–3 hours | None — start here |
-| 2 | `05c_xgboost_v2.ipynb` (Optuna) | 3–5 hours (GPU) | 04b complete |
-| 3 | `05d_validation_diagnostics_v2.ipynb` | 2–3 hours | 05c complete |
-| 4 | Calibration gate decision locked | — | 05d complete |
-| 5 | `06_lightgbm_demand.ipynb` (Optuna) | 3–5 hours (GPU) | 04b complete |
-| 6 | Fold 2 model comparison (Section 6 of 06) | 1 hour | 05d + 06 complete |
-| 7 | **`07_fold3_final_evaluation.ipynb`** | 2–3 hours | ALL above + gate locked |
-| 8 | `08_explainability.ipynb` | 2–3 hours | 07 complete |
-| 9 | Streamlit app | 1–2 days | 07 complete |
-| 10 | README + portfolio | Half day | All notebooks complete |
+| 0 | Lock `06b` winner decision | 30 min | None — do immediately |
+| 1 | `06c` SKU audit + regime classification | 2–3 hrs | 06b locked |
+| 2 | `06d` Model optimization | 3–4 hrs | 06c complete |
+| 3 | `06e` Conformal prediction | 2–3 hrs | 06d complete |
+| 4 | `06f` Intermittent demand (Croston/TSB) | 2–3 hrs | 06c complete (parallel with 06d/06e) |
+| 5 | `06g` Inventory simulation | 3–4 hrs | 06e + 06f complete |
+| 6 | `07` Fold 3 — run once | 3–4 hrs | ALL above locked |
+| 7 | `08` Explainability | 2–3 hrs | 07 complete |
+| 8 | `09` App data prep | 1–2 hrs | 07 + 08 complete |
+| 9 | `app.py` Streamlit | 2–3 days | 09 complete |
+| 10 | README + portfolio | Half day | All above complete |
 
-**Total modeling work before app:** ~3–4 focused sessions.
+**Total modeling work before app:** ~5–6 focused sessions.
 
-LightGBM training (step 5) may run in parallel with steps 2–4 if separate
-GPU resources are available — it has no dependency on 05c beyond the 04b
-parquet files. If running sequentially, start 05c first.
+`06f` (Croston/TSB) can run in parallel with `06d` and `06e` since it only
+depends on `06c` regime assignments and does not require the optimized
+Tweedie model.
 
 ---
 
-## Key Decisions Already Made (Do Not Revisit)
+## Key Decisions Locked — Do Not Revisit
 
 | Decision | Rationale |
 |---|---|
-| v1 notebooks (01–05b) are frozen | Documented before-state. Modifying them destroys the improvement narrative. |
-| Optuna re-runs on Fold 2 only | Feature space changed — v1 params may not be optimal for v2. Correct, not overfitting. |
-| Both models go to Fold 3 | Winner selected on Fold 2. Fold 3 confirms generalization of both. |
-| Holiday suppression is unconditional | Business constraint. Stores are closed. No performance gate applies. |
-| Calibration method: isotonic regression | Smooth, non-parametric, monotone-constrained. No arbitrary bin boundaries. |
-| Calibration is validation-gated | Must improve bias ≥20% without worsening RMSE >0.010 on Fold 2 to be adopted. |
-| Fold 3 calibrator re-fit from Fold 3 training data | Training window is one year longer — zero rates should use full history. Method is the same; values are recomputed. |
-| Fold 3 run once, results locked | Non-negotiable. Any retraining after seeing Fold 3 is leakage regardless of intent. |
-| No modeling decision after Fold 3 | Once the notebook runs, the pipeline is locked. Fold 3 results are for reporting only. |
+| Production model: LightGBM Tweedie | Best per-SKU demand ratio, unit-space predictions, no retransformation bias |
+| Global calibration: rejected | Overcorrects at series level. Demand ratio 2.3–2.5× median post-calibration |
+| Department corrections: rejected | Same architectural flaw as global calibration at finer granularity |
+| SKU routing: Syntetos-Boylan ADI/CV² | Data property — no ground truth needed, recomputes on expanding window, industry standard |
+| Uncertainty: conformal prediction | Coverage-guaranteed intervals from one model, no quantile crossing, all service levels |
+| Intermittent SKUs: Croston/TSB | Architecturally correct for zero-inflated intermittent demand. ML not the right tool here |
+| Optimization: evaluate on per-SKU weekly WAPE | Aggregate metrics mask SKU-level behavior and are useless for inventory decisions |
+| Fold 3: run once, results locked | Non-negotiable. Any retrain after seeing Fold 3 is leakage |
+| Hysteresis: 4-week gate | Prevents regime boundary flip-flopping in production |
 
 ---
 
-## What the Portfolio Narrative Looks Like at the End
+## The Portfolio Narrative at the End
 
-The repository tells a complete, auditable story in sequence:
+The repository tells a complete, auditable story:
 
-1. **EDA** — understand demand structure
-2. **Baselines** — establish signal ceiling with SARIMA and Prophet
-3. **Feature engineering v1** — first principled attempt
-4. **XGBoost v1** — tuned, validated, diagnosed
-5. **Diagnostic notebook** — principal-level weakness identification
-6. **Feature engineering v2** — structured improvements from diagnostics
-7. **XGBoost v2 + LightGBM** — improved pipeline, fair comparison
-8. **Calibration gate** — calibration earns adoption or is rejected by evidence
-9. **Fold 3** — one clean final result, never touched before this moment
-10. **Explainability** — SHAP confirms the fixes worked
-11. **App** — converts forecasts into decisions
+1. **EDA** — understand demand structure and sparsity
+2. **Baselines** — SARIMA and Prophet establish signal ceiling
+3. **Feature engineering v1 → v2** — principled improvement from diagnostics
+4. **XGBoost v1 → v2 → LightGBM Tweedie** — model progression with documented rationale
+5. **Model selection** — Tweedie wins; global calibration rejected by evidence
+6. **SKU audit** — demand regime classification, not aggregate metrics
+7. **Optimization** — targeted improvement on the right SKU segment
+8. **Uncertainty quantification** — conformal prediction, coverage guaranteed
+9. **Intermittent handling** — Croston/TSB where ML cannot forecast reliably
+10. **Inventory simulation** — stockout rate and fill rate on holdout data
+11. **Fold 3** — one clean production simulation, never touched before this moment
+12. **Explainability** — SHAP confirms model learns the right demand drivers
+13. **App** — any SKU, any service level, reorder recommendation in < 60 seconds
+
+**The headline you say in every interview:**
+
+> "At 90% service level and 7-day lead time, the system achieves [X]% fill rate
+> on the Fold 3 holdout — [Y] percentage points better than naive reorder at
+> equivalent average inventory, reducing estimated total inventory cost by $Z
+> on the validation window. Intermittent SKUs are handled via Croston/TSB
+> rather than forcing a global ML model onto data with insufficient signal."
+
+Fill in X, Y, Z from Phase E (Fold 2) simulation results as soon as 06g is
+complete. Do not wait for Fold 3. Fold 2 numbers anchor the story; Fold 3
+confirms it.
+
+## Minimum Viable Production System
+
+*Answer this question before every interview: "If you had two weeks, what
+ships?"*
+
+The irreducible core of this system is four components. Everything else is
+supporting analysis and diagnostics:
+
+1. **LightGBM Tweedie** — point forecasts for Smooth and Erratic SKUs
+2. **Croston/TSB routing** — principled forecasts for Intermittent/Lumpy SKUs
+   where the global model has no signal
+3. **Conformal prediction wrapper** — coverage-guaranteed intervals from one
+   calibration step, no distributional assumptions
+4. **Inventory simulation layer** — converts forecasts to reorder decisions
+   and measures business outcomes, not just accuracy
+
+Every other notebook (optimization branches, SHAP by regime, coverage
+validation tables, anomaly detection) strengthens the case for these four
+components. None of them are the system. If an interviewer asks "what would
+you cut?", the answer is: the optimization search in 06d becomes a fixed
+hyperparameter set, and the SHAP analysis becomes a single global importance
+chart. The four components above do not get cut.
+
+**The whiteboard version (practice this):**
+
+Raw sales data
+↓
+ADI + CV² per SKU  →  Regime classification (Syntetos-Boylan)
+↓                        ↓
+Smooth/Erratic           Intermittent/Lumpy
+↓                        ↓
+LightGBM Tweedie          Croston/TSB
+↓                        ↓
+Conformal intervals      Native uncertainty
+↓                        ↓
+└──────────┬─────────────┘
+↓
+Reorder point + safety stock
+↓
+Inventory simulation → Fill rate, stockout rate, cost
+
+---
 
 Every notebook is a frozen artifact. Every decision is documented and justified.
-The before-and-after comparison (v1 → v2) is built into the repository structure.
-The calibration gate demonstrates production-aware pipeline thinking.
-This is what a senior ML practitioner's development history looks like.
+The before-and-after narrative is built into the repository structure.
+The system answers the question that matters in production:
+**not how accurate is the forecast, but how good are the inventory decisions.**
