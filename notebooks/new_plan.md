@@ -309,81 +309,113 @@ either threshold boundary are flagged as "boundary SKUs" in the output.
 ### Notebook: `06d_model_optimization.ipynb`
 
 **Purpose:** Improve Tweedie point forecast accuracy on Smooth and Erratic
-SKUs. Do not attempt to fix Intermittent or Lumpy SKUs here — they are
-handled in Phase D.
+SKUs by testing three targeted architectural changes against a fair baseline.
+Do not attempt to fix Intermittent or Lumpy SKUs here — they are handled
+in Phase D.
 
-**All optimization is evaluated on per-SKU weekly WAPE distribution, not
-aggregate metrics. An optimization is only adopted if it improves the
-median per-SKU weekly WAPE without worsening the p90.**
+**Core principle:** Hyperparameters are frozen from 06b. Each experiment
+changes exactly one architectural decision — target variable or loss
+function. This is a controlled comparison, not a new hyperparameter search.
+Changing one thing at a time means if an experiment wins, we know why.
 
-**Section 1 — Baseline: Tweedie Suppressed on Smooth + Erratic SKUs Only**
+**Evaluation metric:** Per-SKU weekly WAPE distribution on Smooth + Erratic
+SKUs only. An experiment is adopted only if it improves median per-SKU
+weekly WAPE by ≥ 5% without worsening p90. If no experiment clears this
+bar, the 06b model is retained and documented as the production model.
+A null result is a valid and honest finding.
 
-Re-evaluate the 06b Tweedie suppressed predictions filtered to Smooth +
-Erratic SKUs only. This is the correct baseline — prior evaluations mixed
-in Intermittent and Lumpy SKUs which dragged aggregate metrics down.
+---
 
-Document: median weekly WAPE, p75, p90, % SKUs < 30%, % SKUs < 50%,
-% SKUs > 100% — on Smooth + Erratic SKUs only.
+**Experiment 0 — Fair Baseline**
 
-**Section 2 — Optimization Option A: Direct Multi-Step Target**
+Re-evaluate 06b Tweedie Raw filtered to Smooth + Erratic SKUs only.
+Prior evaluations included Intermittent and Lumpy SKUs which suppressed
+the headline numbers. The true performance on forecastable SKUs is the
+correct baseline for all comparisons.
 
-**What it is:** Retrain Tweedie with the 7-day forward sum as the target
-instead of next-day demand. This eliminates error accumulation from
-recursive daily forecasting and directly optimizes the signal used for
-weekly inventory decisions.
+Metrics to document: median weekly WAPE, p75, p90, % SKUs < 30%,
+% SKUs < 50%, % SKUs > 100%, median demand ratio, % SKUs with demand
+ratio in 0.8–1.2 band.
 
-**Implementation:**
-- Modify feature engineering to produce `target_7d = sum of next 7 days demand`
-- Retrain Tweedie on Fold 2 training data with new target
-- Evaluate per-SKU weekly WAPE on Smooth + Erratic SKUs
+---
 
-**Expected impact:** Should improve weekly WAPE directly since the model
-is now trained on the exact aggregation level used for reorder decisions.
+**Experiment A — Direct 7-Day Target**
 
-**Section 3 — Optimization Option B: Asymmetric Loss Function**
+Retrain Tweedie with frozen 06b hyperparameters, changing only the target
+from next-day demand to 7-day forward sum.
 
-**What it is:** Replace the symmetric Tweedie loss with a custom objective
-that penalizes underprediction more heavily than overprediction. Directly
-encodes the business reality that stockouts cost more than carrying excess
-inventory.
+Rationale: the model currently trains on daily demand but inventory
+decisions are made weekly. This horizon mismatch means the model is
+optimizing the wrong signal. Training directly on the 7-day sum eliminates
+daily error accumulation and aligns the optimization target with the
+actual decision being made.
 
-**Implementation:**
+Implementation: for each row in the training set, compute
+`target_7d = sum of units_sold over the next 7 calendar days`.
+Rows within 7 days of the training window end are dropped — no lookahead.
+Everything else identical to 06b.
+
+No Optuna. Frozen params. One retrain.
+
+---
+
+**Experiment B — Asymmetric Loss**
+
+Retrain Tweedie with frozen 06b hyperparameters and daily target,
+replacing the Tweedie loss with a custom asymmetric objective.
+
+Rationale: stockout cost > holding cost in retail. A symmetric loss
+function treats a 10-unit underforecast identically to a 10-unit
+overforecast. The asymmetric loss directly encodes the business reality
+that underforecasting is more expensive.
+
+Alpha controls the asymmetry — the single parameter being searched:
 
 ```python
-def asymmetric_loss(y_true, y_pred, alpha=0.6):
-    """
-    alpha > 0.5 penalizes underprediction more than overprediction.
-    alpha = 0.6 means underprediction errors are weighted 1.5× overstock errors.
-    Tune alpha on Fold 2 per-SKU demand ratio distribution.
-    """
-    residual = y_true - y_pred
-    grad = np.where(residual > 0, -2 * alpha * residual,
-                                  -2 * (1 - alpha) * residual)
-    hess = np.where(residual > 0, 2 * alpha,
-                                  2 * (1 - alpha))
-    return grad, hess
+alpha = 0.50  # symmetric — identical to standard loss
+alpha = 0.60  # underforecast penalized 1.5× more
+alpha = 0.70  # underforecast penalized 2.3× more  
+alpha = 0.80  # underforecast penalized 4.0× more
 ```
 
-Tune `alpha` on Fold 2 val. Target: shift median per-SKU demand ratio
-toward 0.90–0.95 without pushing p90 above 1.5.
+Alpha grid: 16 evenly spaced values from 0.50 to 0.80. For each value,
+retrain once with frozen params and evaluate median demand ratio on val.
+Optimal alpha = value that puts median demand ratio closest to 1
+(slight upward bias appropriate for retail) without pushing p90 above 1.4.
+This is a simple loop, not Optuna — one parameter, smooth landscape,
+no intelligent sampling needed.
 
-**Section 4 — Comparison and Selection**
+---
 
-Run both options. Compare against baseline on:
-- Median per-SKU weekly WAPE
-- p90 per-SKU weekly WAPE (tail behavior)
-- Median per-SKU demand ratio
-- % SKUs with demand ratio in 0.8–1.2 band
+**Experiment C — A + B Combined**
 
-Select the option that best improves the distribution without degrading the
-tail. If neither clears a 5% improvement in median weekly WAPE, retain the
-06b Tweedie suppressed model as-is and document the result. Do not force an
-improvement that is not there.
+Retrain with frozen params, 7-day target, and best alpha from Experiment B.
+Tests whether the two improvements compound. If both A and B individually
+help, C is likely the winner. If only one helps, C may or may not beat
+the individual winner — let the data decide.
+
+---
+
+**Section 5 — Comparison and Winner Selection**
+
+Full distribution comparison across Experiments 0, A, B, C:
+
+| Metric | Exp 0 | Exp A | Exp B | Exp C |
+|---|---|---|---|---|
+| Median WAPE | | | | |
+| p75 WAPE | | | | |
+| p90 WAPE | | | | |
+| % SKUs < 30% | | | | |
+| % SKUs > 100% | | | | |
+| Median demand ratio | | | | |
+| % ratio in 0.8–1.2 | | | | |
+
+Winner selected on median per-SKU weekly WAPE. Adopted only if ≥ 5%
+improvement over Experiment 0. Otherwise 06b model retained as-is.
 
 **Outputs:**
-- `tweedie_optimized_fold2.txt` — winning optimized model
-- `tweedie_optimization_results.pkl` — comparison table for portfolio
-
+- `tweedie_optimized_fold2.txt` — winning model (may be 06b model unchanged)
+- `tweedie_optimization_results.pkl` — full comparison table for portfolio
 ---
 
 ## Phase C — Uncertainty Quantification
