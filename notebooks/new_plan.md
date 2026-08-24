@@ -512,107 +512,159 @@ These are defaults. The app allows override per SKU.
 
 ---
 
-## Phase D — Intermittent Demand Handling
+# Phase D — Intermittent Demand Handling
+
 ### Notebook: `06f_intermittent_demand.ipynb`
 
-**Purpose:** Provide principled forecasts for Intermittent and Lumpy SKUs
-that the global Tweedie model cannot handle. Do not apply ML where the
-signal does not support it.
+**Purpose:** Provide principled forecasts for Intermittent SKUs via TSB, implement policy-based fallback for Lumpy SKUs, and empirically validate that domain-specific methods outperform the global Tweedie model on these regimes.
 
-**Section 1 — Croston's Method for Intermittent SKUs**
+---
 
-Croston's method separates demand into two components:
-- **Demand size:** exponential smoothing on the magnitude of demand when it
-  occurs (nonzero observations only)
-- **Demand interval:** exponential smoothing on the number of periods between
-  demand events
+## Section 1 — Setup & Regime Isolation
 
-Point forecast = smoothed demand size ÷ smoothed demand interval.
-This gives "expected demand per period" accounting for the intermittent pattern.
+Load 06c outputs and isolate SKUs by demand regime:
 
-**TSB variant (Terence-Syntetos-Boylan):** Improves on original Croston by
-letting demand probability decay when no demand is observed. Better for SKUs
-that may be dying or seasonal. Use TSB as default.
+* **Intermittent:** 14,268 SKUs (`ADI ≥ 1.32`, `CV² < 0.49`) → TSB method
+* **Lumpy:** 7,003 SKUs (`ADI ≥ 1.32`, `CV² ≥ 0.49`) → Historical Policy
+* **Smooth + Erratic:** 9,219 SKUs → Already handled by 06d/06e
 
-```python
-def tsb_forecast(demand: np.ndarray, alpha: float = 0.1,
-                 beta: float = 0.1) -> float:
-    """
-    TSB forecast for intermittent demand.
-    alpha: smoothing for demand probability
-    beta:  smoothing for demand size
-    Returns: expected demand per period
-    """
-    p = (demand > 0).mean()   # initialize demand probability
-    z = demand[demand > 0].mean() if (demand > 0).any() else 0.0
-    for d in demand:
-        if d > 0:
-            p = (1 - alpha) * p + alpha * 1.0
-            z = (1 - beta)  * z + beta  * d
-        else:
-            p = (1 - alpha) * p
-    return p * z
-```
+Confirm ID match and validate zero-fraction distribution.
 
-Tune alpha and beta on Fold 2 training data per SKU via grid search.
-Evaluate on Fold 2 val: per-SKU weekly WAPE on Intermittent SKUs.
+---
 
-**Section 2 — Historical Policy for Lumpy SKUs**
+## Section 2 — TSB Implementation for Intermittent SKUs
 
-Truly unforecastable SKUs (Lumpy regime: high ADI, high CV²) should not
-receive an ML or statistical forecast. The correct approach is a min-max
-inventory policy driven by historical demand.
+Implement **TSB (Teunter-Syntetos-Babai)** with probability decay:
+
+* **p:** Demand probability, updated every period, including zeros
+* **z:** Non-zero demand size, updated only when demand occurs
+* **Forecast:** `p × z` — expected demand per period
+
+**Why TSB:** Prevents indefinite obsolete-SKU forecasting, addressing the known Croston/SBA failure mode.
+
+**Validation:** Perform an in-sample mechanism check across all 14,268 Intermittent SKUs.
+
+---
+
+## Section 3 — Parameter Selection (Walk-Forward, Fold 2 Split)
+
+Grid search:
+
+* `α, β ∈ {0.05, 0.1, 0.2, 0.3}`
+* Use a 5,000-SKU sample for parameter selection
+* Evaluate on held-out Fold 2 validation weeks (`814 days`)
+* Rank configurations by **median per-SKU weekly WAPE**
+* Validate the selected parameters on the full population of 14,268 Intermittent SKUs
+
+---
+
+## Section 4 — Historical Policy for Lumpy SKUs
+
+Implement a **min-max inventory policy** for the 7,003 Lumpy SKUs:
 
 ```python
-def historical_policy_forecast(train_demand: pd.Series,
-                                lead_time_weeks: int = 1,
-                                buffer_multiplier: float = 1.25) -> dict:
-    """
-    Min-max reorder policy for Lumpy SKUs.
-    Reorder point: max weekly demand in same calendar period last year × buffer
-    Order quantity: bring inventory up to max observed weekly demand × buffer
-    """
+def historical_policy_forecast(
+    train_demand,
+    lead_time_weeks=1,
+    buffer_multiplier=1.25
+):
     weekly_demand = train_demand.resample('W').sum()
-    max_weekly    = weekly_demand.max()
-    avg_weekly    = weekly_demand.mean()
-    reorder_point = max_weekly * lead_time_weeks * buffer_multiplier
-    order_qty     = max_weekly * buffer_multiplier - avg_weekly
+    max_weekly = weekly_demand.max()
+    avg_weekly = weekly_demand.mean()
+
+    reorder_point = (
+        max_weekly
+        * lead_time_weeks
+        * buffer_multiplier
+    )
+
+    order_qty = max(
+        max_weekly * buffer_multiplier - avg_weekly,
+        avg_weekly
+    )
+
     return {
         'reorder_point': reorder_point,
-        'order_qty':     max(order_qty, avg_weekly),
-        'max_weekly':    max_weekly,
-        'avg_weekly':    avg_weekly,
+        'order_qty': order_qty,
+        'max_weekly': max_weekly,
+        'avg_weekly': avg_weekly
     }
 ```
 
-**Section 3 — Evaluation: Croston vs Tweedie on Intermittent SKUs**
+**Why policy:** Lumpy SKUs have insufficient signal for reliable point forecasting.
 
-Direct comparison on the Fold 2 val set for Intermittent SKUs only:
-- Per-SKU weekly WAPE: Croston/TSB vs Tweedie suppressed
-- Demand ratio: Croston/TSB vs Tweedie suppressed
-- Show that Croston/TSB improves over the global model on this segment
+**Buffer:** Default = `1.25` (retail standard, approximately 80–85% service level). Tune in 06g.
 
-This is a key portfolio moment — demonstrating that you know when not to
-use ML and apply a domain-appropriate method instead.
+---
 
-**Section 4 — Unified Prediction Output**
+## Section 5 — Evaluation: TSB vs Tweedie on Intermittent SKUs
 
-Combine all routing paths into a single predictions dataframe:
+**Key portfolio validation:** Directly compare TSB against the global Tweedie model on the Fold 2 validation set.
 
-```python
-# final_predictions_fold2.parquet schema:
-# id | date | regime | routing | point_forecast |
-# q50 | q75 | q80 | q90 | q95 | q99 |
-# interval_source ('conformal' / 'croston_native' / 'policy')
+### Metrics
+
+* Per-SKU weekly WAPE
+* Demand ratio distribution
+* Improvement rate
+
+### Target
+
+**TSB >90% improvement rate over Tweedie on Intermittent SKUs.**
+
+### Proof Objective
+
+Demonstrate empirically that the **domain-specific intermittent-demand method outperforms the global ML model on sparse demand regimes**.
+
+This section is critical because it provides the evidence supporting the routing decision rather than simply assuming that TSB is better for Intermittent SKUs.
+
+---
+
+## Section 6 — Unified Prediction Output
+
+Combine all routing methods into a single prediction dataframe.
+
+### Schema
+
+```text
+id | regime | routing | point_forecast | q50 | q75 | q80 | q90 | q95 | q99 | interval_source
 ```
 
-For Croston SKUs: q50 = TSB point forecast; q90 = point forecast +
-2× std of nonzero demand observations.
-For Lumpy SKUs: all quantiles = historical policy reorder point.
+### Intermittent — TSB
 
-**Outputs:**
-- `croston_predictions_fold2.parquet`
-- `final_predictions_fold2.parquet` — unified, all SKUs, all service levels
+* `routing = TSB`
+* `point_forecast = TSB forecast`
+* `q50 = point_forecast`
+* `q90 = point_forecast + 2 × std(nonzero demand)`
+
+### Lumpy — Historical Policy
+
+* `routing = historical_policy`
+* `point_forecast = reorder_point`
+* All quantiles equal `reorder_point`
+
+### Outputs
+
+* `croston_predictions_fold2.parquet`
+* `final_predictions_fold2.parquet`
+* `lumpy_policy_params.pkl`
+
+---
+
+# Structure Summary
+
+| Section | Content                       | Status                   |
+| ------- | ----------------------------- | ------------------------ |
+| 1       | Setup & Regime Isolation      | ✅ Done                   |
+| 2       | TSB Implementation            | ✅ Done                   |
+| 3       | Parameter Selection           | 🟡 In Progress           |
+| 4       | Historical Policy             | ⬜ Not Started            |
+| 5       | **TSB vs Tweedie Comparison** | ⬜ **Critical — Missing** |
+| 6       | Unified Output                | ⬜ Not Started            |
+
+> **Yes, Section 5 was missing: TSB vs Tweedie.**
+>
+> This is the **portfolio differentiator**. Without this comparison, the routing decision is not empirically justified. The goal of Section 5 is to demonstrate that the domain-specific TSB method actually outperforms the global Tweedie model for Intermittent SKUs on the same held-out Fold 2 validation set.
+
 
 ---
 
