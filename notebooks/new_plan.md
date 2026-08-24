@@ -652,19 +652,41 @@ id | regime | routing | point_forecast | q50 | q75 | q80 | q90 | q95 | q99 | int
 
 # Structure Summary
 
-| Section | Content                       | Status                   |
-| ------- | ----------------------------- | ------------------------ |
-| 1       | Setup & Regime Isolation      | ✅ Done                   |
-| 2       | TSB Implementation            | ✅ Done                   |
-| 3       | Parameter Selection           | 🟡 In Progress           |
-| 4       | Historical Policy             | ⬜ Not Started            |
-| 5       | **TSB vs Tweedie Comparison** | ⬜ **Critical — Missing** |
-| 6       | Unified Output                | ⬜ Not Started            |
+| Section | Content                       | Status                                                  |
+| ------- | ----------------------------- | -------------------------------------------------------- |
+| 1       | Setup & Regime Isolation      | ✅ Done                                                   |
+| 2       | TSB Implementation            | ✅ Done                                                   |
+| 3       | Parameter Selection           | ✅ Done — α=β=0.5, 52% WAPE improvement over naive        |
+| 4       | Historical Policy (Lumpy)     | ✅ Done — min-max policy, tiered buffer, order_qty floors |
+| 5       | **TSB vs Tweedie Comparison** | ✅ Done — TSB beats Tweedie on 99.0% of matched SKUs      |
+| 6       | Safety Stock (Intermittent)   | ✅ Done — see schema deviation note below                 |
+| 7       | Unified Output (Lumpy+Intermittent) | ✅ Done — order_qty gap closed, see Pre-flight note in Phase E |
 
-> **Yes, Section 5 was missing: TSB vs Tweedie.**
->
-> This is the **portfolio differentiator**. Without this comparison, the routing decision is not empirically justified. The goal of Section 5 is to demonstrate that the domain-specific TSB method actually outperforms the global Tweedie model for Intermittent SKUs on the same held-out Fold 2 validation set.
+> **Section 5 (TSB vs Tweedie) is done and stronger than the original bar.** Median WAPE
+> 31.76% (TSB) vs 50.09% (Tweedie), 99.0% win rate. The more important result for the
+> portfolio narrative isn't the average — it's the tail: 0.0% of TSB forecasts exceed 100%
+> WAPE vs. 13.3% for Tweedie, and Tweedie's worst SKU hits 2,202% WAPE vs. 114% for TSB.
+> Tweedie doesn't just do worse on average on these SKUs, it periodically fails
+> catastrophically — exactly the failure mode the regime routing exists to prevent.
 
+> **Section 6's output schema deviates from the original spec above, deliberately.** The
+> original design called for a shared `q50...q99` quantile schema across all routing methods
+> (see the original Section 6 spec below, kept for reference). In practice, TSB's Bernoulli(p)
+> × bootstrapped-size design under-covered by ~11pp in walk-forward validation (real demand
+> clusters in time; independent-per-day resampling understates 7-day variance). The fix — a
+> moving-block bootstrap that resamples real historical 7-day windows directly — produces a
+> `safety_stock_q80` at one locked service level per SKU, not a full quantile ladder. This is
+> the right tradeoff (82.1% empirically validated coverage vs. an unvalidated quantile schema)
+> but it means Intermittent/Lumpy's actual output is `reorder_point`/`safety_stock`/`order_qty`
+> directly, not `q50...q99`. **This has real consequences for 06g — see the Pre-flight section
+> below before writing 06g Section 1.**
+
+*(Original Section 6 spec, superseded by the above — kept for context, not a target to
+re-implement):*
+
+```text
+id | regime | routing | point_forecast | q50 | q75 | q80 | q90 | q95 | q99 | interval_source
+```
 
 ---
 
@@ -675,9 +697,78 @@ id | regime | routing | point_forecast | q50 | q75 | q80 | q90 | q95 | q99 | int
 outcomes on the Fold 2 val window. Produce the headline business metrics
 that anchor the portfolio narrative.
 
+---
+
+### Pre-flight — Reconciling This Plan With What 06f Actually Shipped
+
+Written after 06f closed out. Four adaptations are required before Section 1 below can run
+as originally written — none of them are optional, and none require redoing 06f.
+
+**1. Only Smooth/Erratic needs `compute_reorder_params`. Lumpy and Intermittent already have
+final numbers.** The function below (quantile-width → safety-stock) was designed as one
+generic path for every regime. That assumption no longer holds:
+- **Lumpy** (`unified_lumpy_intermittent_fold2.parquet`, `regime == 'lumpy'`): `reorder_point`,
+  `order_qty` already computed via the min-max policy. Use directly.
+- **Intermittent** (same file, `regime == 'intermittent'`): `reorder_point` (=
+  `safety_stock_q80`) and `order_qty` (= TSB's `z_final`, floored) already computed via block
+  bootstrap. Use directly.
+- **Smooth/Erratic** (9,219 SKUs): this is the *only* regime that still needs
+  `compute_reorder_params`. 06e never built a reorder table — it saved raw per-SKU residuals
+  only (`conformal_residuals_fold2.pkl`: `sku_residuals`, `default_service_level=0.80`,
+  `residual_unit`). Section 1 below needs to load that pickle plus
+  `tweedie_optimized_predictions_fold2.parquet` (for `yhat`) and build `reorder_point`/
+  `safety_stock` from scratch — this is genuinely new work, not a merge.
+
+**2. `order_qty` for Smooth/Erratic is still undefined.** The original plan never specified a
+replenishment quantity for the conformal-wrapped regime — only `reorder_point`. 06f resolved
+the equivalent gap for Intermittent by using TSB's `z_final` (mean nonzero demand size) as the
+cycle-stock unit. The Smooth/Erratic analogue is the model's own point forecast — e.g.
+`order_qty = point_forecast_weekly × lead_time_weeks` (order one lead-time's worth of expected
+demand) — but this needs an explicit decision here, the same way it did in 06f, not a silent
+default inside `simulate_inventory`.
+
+**3. `reorder_qty` in `simulate_inventory` below is a fixed value per SKU, decided once — not
+computed dynamically inside the simulation loop.** The original docstring said
+`reorder_qty = reorder_point - current_inventory (when triggered)` (an order-up-to-S policy),
+but the function signature took a static `reorder_qty` argument — those two are inconsistent
+policies and only one can be implemented. **Resolved: use the static, precomputed `order_qty`
+column** (matches what 06f now produces for Lumpy/Intermittent, and what item 2 above proposes
+for Smooth/Erratic) — an order-up-to-S policy would need `simulate_inventory`'s signature
+changed to drop `reorder_qty` and compute it inline from `reorder_point`, which is a bigger
+change and wasn't validated anywhere in this pipeline. Keep the fixed-quantity policy for
+consistency across all three regimes; the code below reflects this.
+
+**4. `sqrt(lead_time)` scaling in `compute_reorder_params` is an untested independence
+assumption — validate it, don't inherit it.** 06e confirmed the winning model (`experiment_0`)
+predicts in **next-day units**, so this scaling assumes i.i.d. daily forecast errors. 06f
+Section 6 already found the opposite for Intermittent SKUs — real demand clusters in time,
+and an i.i.d.-per-day simulation under-covered by ~11pp until replaced with a block bootstrap.
+Smooth/Erratic demand is more regular and may hold up better under the independence
+assumption, but "may" isn't a validated claim. **Before trusting Smooth/Erratic reorder
+points, run the same rolling-origin coverage check 06f Section 6 used** (aggregate actual
+7-day-forward demand vs. the `sqrt(7)`-scaled interval, walk-forward through the val period) —
+reuse the pattern, don't assume it transfers.
+
+**5. Reconcile cadence across all three regimes before the final merge, the same way 06f
+Section 7 did for Lumpy vs. Intermittent.** Lumpy uses calendar-week (`resample('W')`)
+aggregation; Intermittent uses a rolling daily block bootstrap over a 7-day window; Smooth/
+Erratic will aggregate native next-day residuals into a 7-day figure in Section 1 below. Add
+an explicit assert/cadence-check cell here (mirroring 06f Section 7's `LEAD_TIME_DAYS == 7`
+assert) before concatenating all three into one table — don't assume alignment.
+
+**6. `safety_buffer < 0` is informative, not an error, for a known Intermittent cohort.** 06f
+Section 7 found that some Intermittent SKUs legitimately have `safety_stock_q80 = 0` with
+positive expected demand (reactive-only reordering — no proactive buffer justified at that
+SKU's sparsity, but `order_qty > 0` guarantees it still restocks on depletion). Carry the
+`regime` + `safety_buffer < 0` combination into Section 5's per-regime breakout rather than
+treating it as a data-quality flag.
+
+---
+
 **Section 1 — Reorder Parameter Computation**
 
-For each SKU, compute reorder parameters from the unified predictions:
+For Smooth/Erratic SKUs only (see Pre-flight #1) — Lumpy and Intermittent read their
+`reorder_point`/`order_qty` directly from `unified_lumpy_intermittent_fold2.parquet`:
 
 ```python
 def compute_reorder_params(sku_id: str,
@@ -686,21 +777,27 @@ def compute_reorder_params(sku_id: str,
                             lead_time_weeks: int,
                             service_level: float) -> dict:
     """
-    Compute reorder point and safety stock for a single SKU.
+    Compute reorder point, safety stock, and order quantity for a single
+    Smooth/Erratic SKU from its conformal residual quantile.
 
     safety_stock  = (q_upper - point_forecast) × sqrt(lead_time)
-                  = interval half-width scaled by lead time uncertainty
+                  = interval half-width scaled by lead time uncertainty.
+                  NOTE: assumes i.i.d. daily forecast errors -- validate with a
+                  rolling-origin coverage check (Pre-flight #4) before trusting this,
+                  the same way 06f Section 6 validated the block-bootstrap alternative.
     reorder_point = point_forecast × lead_time + safety_stock
-    reorder_qty   = reorder_point - current_inventory (when triggered)
+    order_qty     = point_forecast × lead_time (fixed, precomputed -- see Pre-flight #3)
     """
     interval_width = q90_upper - point_forecast_weekly
     safety_stock   = interval_width * np.sqrt(lead_time_weeks)
     reorder_point  = point_forecast_weekly * lead_time_weeks + safety_stock
+    order_qty      = point_forecast_weekly * lead_time_weeks
     return {
         'sku_id':         sku_id,
         'point_forecast': point_forecast_weekly,
         'safety_stock':   safety_stock,
         'reorder_point':  reorder_point,
+        'order_qty':      order_qty,
         'service_level':  service_level,
     }
 ```
@@ -708,7 +805,9 @@ def compute_reorder_params(sku_id: str,
 **Section 2 — Inventory Depletion Simulation**
 
 Simulate week-by-week inventory depletion on the Fold 2 val window
-(Feb 2014 → Jan 2015) using actual sales as ground truth.
+(Feb 2014 → Jan 2015) using actual sales as ground truth. `reorder_qty` is a fixed,
+precomputed value per SKU (Pre-flight #3) — sourced from `order_qty` in the unified table for
+all three regimes, not recomputed inside the loop.
 
 ```python
 def simulate_inventory(actual_weekly_demand: np.ndarray,
@@ -717,7 +816,7 @@ def simulate_inventory(actual_weekly_demand: np.ndarray,
                         initial_inventory: float,
                         lead_time_weeks: int) -> dict:
     """
-    Simulate inventory trajectory under the reorder policy.
+    Simulate inventory trajectory under a fixed-quantity reorder policy.
     Returns stockout weeks, average inventory, service level achieved.
     """
     inventory     = initial_inventory
