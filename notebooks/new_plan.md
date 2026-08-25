@@ -856,61 +856,94 @@ def simulate_inventory(actual_weekly_demand: np.ndarray,
 
 **Section 3 — Simulate at All Service Levels**
 
-Run the simulation at q50, q75, q80, q90, q95 for all SKUs.
-Aggregate results by regime and service level:
+Run the simulation at q50, q75, q80, q90, q95, **and q99** for all SKUs (extended from the
+original q50-q95 range once Section 4's cost analysis showed the tested range wasn't wide
+enough to bracket a cost minimum -- see Section 4 below). Track `units_short` (cumulative
+unfulfilled demand per SKU) alongside `stockout_rate`, `avg_inventory`, and `fill_rate` --
+required by Section 4's cost formula; a stockout-week *count* is not the same as unit
+shortfall and the two are not proportional across regimes with different order sizes.
+Aggregate results by regime and service level, and pool across all SKUs into one headline
+table -- **this pooled table is the headline result of the entire project.**
 
-```
-Simulation Results — Fold 2 Val (52 weeks, all SKUs):
+**Section 4 — Cost Sensitivity Analysis**
 
-Service level   Stockout rate   Avg inventory   Fill rate
-q50             [result]%       [result] units  [result]%
-q75             [result]%       [result] units  [result]%
-q80             [result]%       [result] units  [result]%
-q90             [result]%       [result] units  [result]%
-q95             [result]%       [result] units  [result]%
+**Revised from the original plan.** The original spec asked for one cost scenario (fixed
+$4.00 unit cost, 2x stockout multiplier, 25% carrying rate) and a single crossover point.
+That approach was abandoned after the locked-scenario run showed cost decreasing
+monotonically through q99 with no interior minimum -- reporting a crossover point that
+wasn't actually there would have repeated the exact class of error Section 3 caught
+earlier (pricing something that wasn't validated). Two changes were made instead:
 
-Naive reorder   [result]%       [result] units  [result]%
-(reorder on mean historical demand — no forecast)
-```
+1. **Real per-SKU unit cost, not a flat $4.00.** `sell_prices.csv` has actual weekly
+   retail sell_price per item_id/store_id, already used elsewhere in this pipeline
+   (01_eda, 04_feature_engineering, 05b) -- joined and averaged over the Fold 2 val window
+   per SKU, with portfolio-median fallback for SKUs missing a price row. Caveat carried
+   into every downstream cost figure: this is retail sell_price, not wholesale/COGS --
+   M5 has no cost field, so this is the same proxy the flat $4.00 was already
+   approximating, just no longer pooled into one number across 30,442 heterogeneous SKUs.
 
-**This table is the headline result of the entire project.**
+2. **Sensitivity sweep instead of one locked scenario.** Stockout multiplier swept
+   {1.5x, 2.0x, 3.0x, 4.0x, 6.0x, 8.0x} x unit cost, carrying rate swept
+   {15%, 20%, 25%, 30%} annual -- 24 combinations, each re-costing the same six
+   already-validated service levels plus naive. Report where the cost-minimizing
+   service level moves (or doesn't) across the full grid, not just at the plan's
+   original 2.0x/25% default.
 
-**Section 4 — Cost Tradeoff Curve**
+**Cross-check against theory:** the newsvendor critical ratio
+`SL* = stockout_cost / (stockout_cost + carrying_cost)` gives an independent prediction
+for the cost-optimal service level at each tested ratio. Compare the sweep's empirical
+optimum against this theoretical value at each of the 24 combinations -- if the sweep's
+tested range (q50-q99) doesn't reach the theoretical optimum, say so explicitly rather
+than reporting the boundary of the tested range as if it were the true minimum.
 
-Plot: as service level increases from q50 to q99, overstock cost increases
-and stockout cost decreases. Find and annotate the crossover point — the
-service level at which total inventory cost is minimized.
+**Known limitation, named rather than fixed here:** carrying cost is modeled as strictly
+linear in avg_inventory (`avg_inventory x unit_cost x carry_rate`). Real overstock cost is
+convex, not linear -- shelf/warehouse capacity constraints, markdown/obsolescence risk
+(relevant given FOODS categories in this dataset), and fixed working-capital budgets all
+put a real ceiling on "more inventory is better" that this model does not capture. Flagged
+as explicit future work, not solved in this pass: (a) convex or capacity-constrained
+carrying cost, (b) a category-specific obsolescence term for perishables, (c) per-SKU
+newsvendor-optimal service levels (since `Cu`/`Co` is SKU-specific) instead of one blanket
+service level swept across the whole portfolio.
 
-Cost parameters (locked for reporting — configurable in app):
-- Median unit cost: $4.00 (M5 dataset approximate)
-- Stockout cost: 2× unit cost per unit short ($8.00) — represents lost sale
-  plus estimated customer churn penalty
-- Carrying cost: 25% of unit cost per year ($1.00/unit/year) — standard
-  retail holding cost assumption
-
-From these, compute and report in the notebook summary cell:
-
-  total_stockout_cost   = stockout_units × $8.00
-  total_carrying_cost   = avg_inventory_units × $1.00
-  total_inventory_cost  = total_stockout_cost + total_carrying_cost
-
-Report the dollar figures at q80 vs naive baseline. This is the headline
-business number for the README and every interview: "At q80 service level,
-the system reduces total inventory cost by approximately $X vs naive reorder
-on the Fold 2 validation window."
+Report the dollar figure at q80 vs. naive baseline as the headline business number for the
+README, **stated with its scope**: "under real per-SKU retail pricing, at q80 service
+level, the system reduces total inventory cost by approximately $X vs. naive reorder,
+and this advantage is stable (range: Y%-Z%) across 24 plausible retail cost-ratio
+assumptions." Do not claim q99 (or any tested boundary point) as the confirmed cost
+optimum -- report it only as the best point within the validated service-level range.
 
 **Section 5 — Simulation by SKU Regime**
 
-Break out simulation results by regime (Smooth, Erratic, Intermittent,
-Lumpy). Confirm:
-- Smooth SKUs achieve high fill rates at low service levels (model is accurate)
-- Lumpy SKUs require high service levels or policy-based buffers to achieve
-  acceptable fill rates
+Break out simulation results by regime (Smooth, Erratic, Intermittent, Lumpy) across all
+six tested service levels. Confirm, with appropriate nuance rather than a binary yes/no:
+- Whether Smooth SKUs achieve comparatively high fill rates, and at which service levels
+  specifically -- check for crossovers against Erratic rather than assuming Smooth leads
+  uniformly.
+- Whether Lumpy's fixed min-max policy fill rate falls within the buffer parameter's
+  documented expected range (Phase E setup: 1.25x buffer, ~80-85% service level) --
+  Lumpy has no quantile lever in this sweep, so "requires high service levels" should be
+  read as "requires an adequately-tuned fixed buffer," not literally interpreted as a
+  quantile claim.
+
+**Additionally, once Section 4's real per-SKU pricing exists:** break out cost
+contribution by regime at q80 (stockout cost, carrying cost, total cost) alongside each
+regime's SKU-count share. Report cost share **separately for carrying cost**, not just
+total cost -- stockout cost dominates total cost heavily enough that a regime can be
+badly over-represented in carrying cost specifically while looking proportional at the
+total-cost level. This is the diagnostic that identifies which regime's buffer/policy
+parameter is worth revisiting if carrying cost (rather than total cost) becomes a target.
 
 **Outputs:**
-- `reorder_parameters_fold2.parquet`
-- `simulation_results_fold2.parquet`
-- Headline numbers locked for README and app
+- `final_reorder_params_fold2.parquet` (Section 1) -- filename as actually produced;
+  earlier plan draft named this `reorder_parameters_fold2.parquet` without the `final_`
+  prefix, corrected here to match what's on disk.
+- `simulation_results_fold2.parquet` (Section 2)
+- `service_level_sweep_fold2.parquet` (Section 3)
+- `naive_baseline_fold2.parquet` (Section 3)
+- `cost_sensitivity_fold2.parquet` (Section 4)
+- Headline numbers locked for README and app, stated with cost-assumption scope per
+  Section 4 above
 
 ---
 
