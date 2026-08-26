@@ -945,6 +945,50 @@ parameter is worth revisiting if carrying cost (rather than total cost) becomes 
 - Headline numbers locked for README and app, stated with cost-assumption scope per
   Section 4 above
 
+
+  ### Post-Section-6 Addendum — Periodic-Review Policy Promotion (before Phase F)
+
+Section 6's diagnostic surfaced that Sections 1–5's production policy is continuous-review
+(s,Q) — reorder point and quantity set once, held fixed for the full val window. This does
+not match the weekly-cadence replenishment pattern the project is meant to model, and the
+forecast (the system's actual product) is used once instead of every review cycle.
+
+**Bug found and fixed:** the periodic-review order-up-to target omitted the review-period
+term (`protection_weeks = lead_time` instead of `lead_time + review_period`), and initial
+dynamic-policy runs reused static's lead-time-only safety stock unmodified — both bias the
+policy toward appearing to need more inventory than it should, and toward looking artificially
+strong (never stocking out) without being genuinely calibrated. Fixed: dynamic policy gets its
+own safety stock, independently swept at q50–q99 for a `sqrt(lead_time + review_period)`
+window, not borrowed from static.
+
+**Decision: Option C.** Promote periodic-review to production; retain static (s,Q) as the
+textbook-baseline comparator (same role Naive already plays relative to static). Three-tier
+story: Naive → Static (s,Q) → Dynamic (periodic-review).
+
+**New sections 7–9 added to 06g before Phase F:**
+- Section 7 — Dynamic policy calibration at full population (all ~30,442 SKUs, not the
+  12-SKU sample). Real weekly forecast per regime: Tweedie trajectory (Smooth/Erratic,
+  reused from Section 6), TSB's native per-timestep trajectory (Intermittent — previously
+  computed in 06f and discarded, now reused; removes the trailing-average proxy caveat
+  entirely), fixed target (Lumpy — no model to refresh, by design).
+- Section 8 — Dynamic cost sensitivity, same real-pricing/24-combination grid as Section 4.
+- Section 9 — Head-to-head: static vs. dynamic, each at its own cost-minimizing service
+  level. This supersedes Sections 3–5's headline numbers; static's tables are kept as the
+  baseline row, not deleted.
+
+**Re-validation required before trusting new numbers:** Pre-flight #4's rolling-origin
+coverage check (originally validated `sqrt(lead_time)` scaling for a 1-week window) must be
+rerun at the widened `sqrt(lead_time + review_period)` window before the new safety stock
+figures are trusted.
+
+**No retraining required.** The production model predicts one day ahead from real historical
+features, not its own prior forecasts — periodic-review only changes the aggregation window
+(2 weeks of daily forecasts vs. 1), not what the model needs to learn. 06d Section 5 already
+tested training directly on a wider horizon (7-day target, Experiments A/C) and found it
+regressed vs. summing daily forecasts — independent evidence this generalizes.
+
+**Phase F (07/Fold 3) is blocked until Section 9 is complete and locked.**
+
 ---
 
 ## Phase F — Fold 3 Final Production Simulation
