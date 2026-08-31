@@ -1007,8 +1007,12 @@ All of the following must be confirmed before any cells execute:
 
 ```python
 # ── Locked decisions from pre-Fold 3 work ─────────────────────────────────
-PRODUCTION_MODEL    = 'tweedie_optimized'  # from 06d
-OPTIMIZATION_METHOD = '[direct_multistep or asymmetric_loss]'  # from 06d
+# 06d tested direct 7-day target and asymmetric loss; both failed the adoption gate
+# (regressed WAPE/p90 WAPE vs. baseline once a target-construction bug was fixed).
+# Neither was adopted -- PRODUCTION_MODEL is the unmodified 06b baseline, saved under
+# 06d's output filename (tweedie_optimized_fold2.txt) but architecturally identical
+# to 06b. No OPTIMIZATION_METHOD to select.
+PRODUCTION_MODEL    = 'tweedie_baseline'  # 06b model, unchanged -- see 06d Section 5
 REGIME_THRESHOLDS   = {'adi': 1.32, 'cv2': 0.49}  # locked in 06c
 CONFORMAL_ALPHA     = [value locked in 06e]
 HYSTERESIS_WEEKS    = 4
@@ -1030,8 +1034,10 @@ Apply hysteresis gate. Document stability.
 
 **Section 3 — Retrain Production Model on Fold 3 Training Data**
 
-Retrain the optimized Tweedie model on the full Fold 3 training window
-using frozen params from 06d. No Optuna, no adjustments.
+Retrain the Tweedie model on the full Fold 3 training window using the frozen
+06b/Experiment-0 hyperparameters -- 06d adopted none of its three experiments
+(direct 7-day target, asymmetric loss, combined), so this is the original baseline
+architecture, not a modified one. No Optuna, no adjustments.
 
 **Section 4 — Conformal Calibration on Fold 3**
 
@@ -1045,7 +1051,23 @@ Apply complete pipeline to Fold 3 val:
 1. Route each SKU by Fold 3 regime classification
 2. Apply optimized Tweedie (Smooth/Erratic) or Croston/TSB (Intermittent/Lumpy)
 3. Apply conformal intervals to Tweedie predictions
-4. Run inventory simulation at q80 and q90
+4. Run inventory simulation for **all three policies** — naive, static continuous-review
+   (s,Q), and dynamic periodic-review — exactly as calibrated in 06g Sections 7 and 9.
+   Reuse those formulas and parameters directly (safety stock, review period, lead time,
+   `52/N_WEEKS_VAL` annualization convention); this is Fold 3 confirming a locked
+   methodology, not re-deriving one. Save per-SKU `units_short`, `avg_inventory`, and
+   `unit_cost` for all three policies, plus fill rate at q50/q75/q80/q90/q95/q99 for the
+   app's service-level selector (Decision 2) — this is the one and only Fold 3 simulation
+   run this notebook performs.
+
+**Section 5b — Cost Views (reuses Section 5's output only, no new simulation)**
+
+Everything below is arithmetic on the single simulation run above — no additional model
+calls or Fold 3 touches, so this doesn't compromise "run exactly once." Apply 06g
+Sections 8–9's exact cost formulas to Fold 3's per-SKU output:
+- Dynamic vs. static-locked cost, 24-scenario real-cost grid (mirrors 06g Section 8)
+- Dynamic vs. static's own cost-minimizing level, same 24-scenario grid (mirrors 06g
+  Section 9) — this is the number that becomes the app's headline (see Section 7 below)
 
 **Section 6 — Evaluate Against Fold 2 Benchmarks**
 
@@ -1059,15 +1081,29 @@ p90 per-SKU weekly WAPE         [F2]%       [F3]%       ±10% = stable
 q90 empirical coverage          [F2]%       [F3]%       ±3pp = stable
 Simulated stockout rate (q80)   [F2]%       [F3]%       ±5pp = stable
 Simulated fill rate (q80)       [F2]%       [F3]%       ±5pp = stable
+Dyn vs static-optimal (2.0x/25%)[F2]%       [F3]%       ±5pp = stable
 ```
+
+The last row compares against 06g Section 9's locked default-scenario number, not a new
+one — it's the cost-based counterpart to the fill-rate rows above and should move
+together with them; a stable fill rate but an unstable cost number (or vice versa) is
+itself worth flagging rather than averaging away.
 
 **Section 7 — Final Headline Numbers**
 
-State the production system's performance in business terms:
+**Primary headline — matches 06g Section 9's locked methodology, not the older single-
+number framing this section originally specified:**
 
-- At q80 service level and 7-day lead time, simulated fill rate on
-  Fold 3 holdout: X%
-- Vs naive reorder baseline: Y% fill rate at equivalent inventory level
+- Dynamic (periodic-review) vs. static's own cost-minimizing level, across the 24
+  real-cost scenarios: X%–Y%, with static's chosen level per scenario reported
+  ("best point in the tested q50–q99 range," never "confirmed cost optimum" — same
+  caveat locked in 06g Section 4/9)
+- Dynamic vs. naive, same 24-scenario grid: A%–B%
+- One representative scenario stated in dollar terms for the README/app (e.g. the 2.0x/
+  25% default): "$Z estimated annual savings vs. naive reorder"
+
+**Supporting detail (still reported, no longer the headline):**
+- Fill rate at q80 and q90, dynamic vs. naive, at equivalent average inventory
 - % of SKUs forecast within 30% weekly error (forecastable SKUs)
 - % improvement over SARIMA/Prophet on representative series
 
@@ -1082,6 +1118,9 @@ This notebook is never run again.
 - `conformal_residuals_fold3.pkl`
 - `final_predictions_fold3.parquet`
 - `simulation_results_fold3.parquet`
+- `dynamic_cost_sensitivity_fold3.parquet` (Section 5b, mirrors 06g Section 8)
+- `static_vs_dynamic_headtohead_fold3.parquet` (Section 5b, mirrors 06g Section 9 —
+  this is the app's headline source)
 
 ---
 
@@ -1319,11 +1358,12 @@ The repository tells a complete, auditable story:
 
 **The headline you say in every interview:**
 
-> "At 90% service level and 7-day lead time, the system achieves [X]% fill rate
-> on the Fold 3 holdout — [Y] percentage points better than naive reorder at
-> equivalent average inventory, reducing estimated total inventory cost by $Z
-> on the validation window. Intermittent SKUs are handled via Croston/TSB
-> rather than forcing a global ML model onto data with insufficient signal."
+> "On the Fold 3 holdout, the dynamic periodic-review policy beats a traditional
+> static reorder policy even at static's own best-case service level, by [X]%–[Y]%
+> across a real-cost sensitivity grid — not just at naive or an arbitrarily-chosen
+> service level. Estimated annual savings of $Z at representative retail cost
+> assumptions. Intermittent SKUs are handled via Croston/TSB rather than forcing
+> a global ML model onto data with insufficient signal."
 
 Fill in X, Y, Z from Phase E (Fold 2) simulation results as soon as 06g is
 complete. Do not wait for Fold 3. Fold 2 numbers anchor the story; Fold 3
