@@ -4,7 +4,7 @@
 **Current state:** `06b_model_selection.ipynb` complete. Tweedie LightGBM is
 the production model. Global isotonic calibration rejected — overcorrects
 at series level (median demand ratio 2.3–2.5×, p90 at 7–8× actual demand).
-Winner lock-in (`WINNER_MODEL`, `WINNER_VARIANT`) is the immediate next step.
+Winner lock-in complete: `WINNER_MODEL='tweedie'`, `WINNER_VARIANT='raw'` (see 06b, locked 2026-06-08).
 
 **Fold 3 discipline:** Fold 3 is run exactly once, at the very end of this
 plan, after all modeling, optimization, uncertainty quantification, and
@@ -23,7 +23,7 @@ correct reorder decision for this SKU right now?
 | Decision | Rationale |
 |---|---|
 | Production model: LightGBM Tweedie | Predicts in unit space directly, no retransformation bias, best demand ratio across most zero-rate buckets |
-| Production variant: suppressed only | Holiday suppression unconditional. Isotonic calibration rejected — series-level overcorrection proved by demand ratio distribution |
+| Production variant: raw | Lowest median per-series WAPE (45.7% vs 48.4% XGB) and MAPE (31.2% vs 37.8% XGB); best demand calibration (76.1% of series within 0.8–1.2 ratio band). Isotonic calibration rejected — series-level overcorrection proved by demand ratio distribution |
 | XGBoost retired as primary candidate | Systematic underprediction (demand ratio 0.761), log-space retransformation bias. Retained in comparison tables only |
 | Primary metric: per-SKU weekly WAPE | Aggregate WAPE masks SKU-level behavior. All optimization decisions from here use SKU-level WAPE distribution, not aggregate |
 | Calibration status: rejected | Median demand ratio 2.315 (XGB) / 2.516 (Tweedie) post-calibration. p90 at 7–8× actual. Architecturally wrong for series-level correction |
@@ -129,13 +129,13 @@ Before any new notebook is opened, fill in the winner decision block in 06b:
 
 ```python
 WINNER_MODEL   = 'tweedie'
-WINNER_VARIANT = 'suppressed'
+WINNER_VARIANT = 'raw'
 RATIONALE      = (
-    "Tweedie wins on unit-space RMSE (3.10 vs 3.39), demand ratio (0.776 vs "
-    "0.761), and WAPE across 4 of 5 zero-rate buckets. Predicts in unit space "
-    "directly — no retransformation bias. Global isotonic calibration rejected: "
-    "series-level demand ratio explodes to 2.3–2.5× median, p90 at 7–8× actual. "
-    "XGBoost retired. Holiday suppression unconditional."
+    "Tweedie Raw achieves the lowest median per-series WAPE (45.7% vs 48.4% XGB), "
+     "lowest median MAPE (31.2% vs 37.8% XGB), and best demand calibration (76.1% "
+     "of series within 0.8–1.2 demand ratio band). Global isotonic calibration "
+     "rejected: series-level demand ratio explodes to 2.3–2.5× median, p90 at "
+     "7–8× actual. XGBoost retired."
 )
 ```
 
