@@ -1124,295 +1124,1214 @@ This notebook is never run again.
 
 ---
 
-## Phase G — Explainability
-### Notebook: `08_explainability.ipynb`
+# Phase G — Explainability
 
-Uses the optimized Tweedie model from Fold 3.
+## Notebook: `08_explainability.ipynb`
 
-**Section 1 — SHAP Global Importance**
+### Purpose
 
-SHAP on the final production Tweedie model. Does feature ranking make
-business sense? Compare against 05b v1 feature importance — document
-which features improved in rank due to v2 engineering.
+Notebook 08 explains and audits the **exact frozen Fold 3 production model**.
 
-**Section 2 — SHAP by Demand Regime**
+No model retraining, hyperparameter tuning, regime changes, service-level selection, or policy changes occur here.
 
-This is the key insight for the portfolio: different SKU types are
-driven by different features. Run SHAP separately per regime:
+The goal is to answer:
 
-- Smooth SKUs: likely dominated by price and recent lag features
-- Erratic SKUs: likely dominated by promotional/calendar features
-- Intermittent SKUs: likely dominated by seasonality and event proximity
+> **Why does the production model make this forecast, and is it using sensible demand information?**
 
-Showing this explicitly demonstrates you understand the demand drivers
-change by SKU type — not just a global importance bar chart.
+SHAP is only applied to the LightGBM Tweedie model because only Smooth and Erratic SKUs are routed through that model.
 
-**Section 3 — Feature Stability Across Departments**
-
-Are the top 5 SHAP features consistent across FOODS, HOBBIES, HOUSEHOLD?
-If a feature ranks #1 globally but #8 in HOBBIES, that is worth noting.
-
-**Section 4 — Per-SKU Waterfall Plots**
-
-Three representative SKUs — one per forecastable regime:
-- FOODS_3_163_CA_3 (Smooth — benchmark series)
-- One Erratic SKU (high-volume, volatile demand)
-- One Intermittent SKU (for contrast — show Croston output vs Tweedie)
-
-**Section 5 — Anomaly Detection on Fold 3 Residuals**
-
-- Z-score flags: demand spikes (z > 3), suppressed demand (z < −3)
-- Flag SKUs with persistent residual bias (systematic over or under
-  in a specific month) — these are candidates for regime reclassification
-  in a production monitoring system
+Intermittent SKUs use TSB and Lumpy SKUs use the historical inventory policy, so those regimes receive routing/policy explanations rather than SHAP explanations.
 
 ---
 
-## Phase H — App Data Preparation
-### Notebook: `09_app_data_prep.ipynb`
+## Section 1 — Global SHAP Importance
 
-Pre-compute everything the app needs. The app does zero model inference
-at runtime — all forecasts and simulations are precomputed and stored as
-parquet.
+Run TreeSHAP on the frozen Fold 3 Tweedie model.
 
-**Outputs to precompute:**
-- Fold 3 predictions for all SKUs at all service levels (q50/q75/q80/q90/q95/q99)
-- Reorder parameters per SKU at 7-day and 14-day lead times
-- Simulation results per SKU (stockout rate, fill rate, avg inventory)
-- SHAP values per SKU (top 5 features + values for waterfall)
-- Regime classification per SKU
-- SKU metadata (department, store, category, mean demand, zero rate)
+Use a representative, fixed prediction population from the Fold 3 production/evaluation data rather than arbitrarily sampling after looking at results.
 
-Load time target: app loads in < 3 seconds. All heavy computation happens here.
+Produce:
 
----
+* global mean absolute SHAP importance
+* top 20 features
+* feature rank
+* mean absolute SHAP value
+* mean signed SHAP value
 
-## Deployment Layer — Streamlit App (`app.py`)
+Primary question:
 
-Five pages. Any SKU selectable on any page. All data precomputed.
+> **What information does the production model actually use?**
 
----
+Do not predict the result beforehand.
 
-### Page 1 — SKU Inventory Dashboard
+### Output
 
-The primary page. Answers: "What should I do about this SKU right now?"
-
-**Inputs (sidebar):**
-- Store / SKU selector (any individual `item_id × store_id`)
-- Current inventory level (units)
-- Supplier lead time (7 days default, configurable)
-- Target service level (80% / 90% / 95% / 99%)
-
-**Outputs:**
-- 28-day demand forecast chart with selected service level band
-- Regime badge (Smooth / Erratic / Intermittent / Lumpy)
-- Forecast confidence score (derived from interval width ÷ mean demand —
-  high = narrow intervals = confident, low = wide intervals = uncertain)
-- Reorder recommendation: quantity and timing
-- Projected stockout date at current inventory level
-- Safety stock suggestion for selected service level
-- If Intermittent/Lumpy: "This SKU uses [Croston/policy]-based forecasting.
-  The model-based approach is not reliable for this demand pattern."
-
-**Aggregation support:**
-Filter to store, department, category, or state level for planning views.
-Point forecasts aggregate by sum. Quantile bands at aggregate levels are
-labeled "indicative" — summing q90 across SKUs overstates aggregate q90
-due to demand diversification.
+`shap_global_fold3.parquet`
 
 ---
 
-### Page 2 — Portfolio Risk Monitor
+## Section 2 — SHAP by Demand Regime
 
-Answers: "Which SKUs need attention this week?"
+Run SHAP separately for:
 
-- Full SKU table: forecast, demand ratio, regime, WAPE tier, stockout risk flag
-- Filterable by store, department, regime, risk level
-- Red highlight: SKUs projected to stockout within lead time at current
-  inventory
-- Yellow highlight: SKUs with recent forecast error spike (rolling WAPE
-  increased > 20% last 4 weeks)
-- Regime change alerts: SKUs that reclassified in the most recent window
+* Smooth
+* Erratic
 
----
+Compare feature importance across regimes.
 
-### Page 3 — Backtesting and Simulation Results
+Produce a table such as:
 
-Answers: "Why should I trust this system?"
+| Feature | Global Rank | Smooth Rank | Erratic Rank |
+| ------- | ----------: | ----------: | -----------: |
 
-- Walk-forward CV results table (all models: Naive, SARIMA, Prophet,
-  XGBoost v1, LightGBM Tweedie)
-- Fold 3 inventory simulation results: fill rate and stockout rate at each
-  service level, vs naive reorder baseline
-- Cost tradeoff curve: total inventory cost vs service level
-- Coverage validation table: does q90 actually cover 90%?
+Also calculate rank correlation between the regime-specific importance vectors.
 
----
+Questions:
 
-### Page 4 — Explainability Engine
+* Which features are consistently important?
+* Which features become more important for Erratic demand?
+* Which features are particularly important for Smooth demand?
+* Are any features unexpectedly dominant?
 
-Answers: "Why is the model forecasting this?"
+Do not include Intermittent or Lumpy SHAP because the production architecture does not use Tweedie for them.
 
-- Global SHAP feature importance bar chart
-- Per-SKU SHAP waterfall (linked to SKU selector — same SKU as Page 1)
-- Top 3 demand drivers in plain English for selected SKU:
-  "Demand for this SKU is primarily driven by: recent sales trend (+),
-  day of week (Fridays peak), proximity to SNAP payment dates (+)"
-- Price elasticity visualization for selected product-store combination
+### Output
+
+`shap_by_regime_fold3.parquet`
 
 ---
 
-### Page 5 — Technical Deep Dive
+## Section 3 — SHAP by Department
 
-For the technical interviewer.
+Compare feature importance across:
 
-- Full metric tables: per-fold log-RMSE, WAPE, bias by model
-- Quantile calibration summary: empirical vs target coverage per level
-- Per-SKU WAPE distribution histograms by regime
-- Error distributions by department and store
-- SHAP feature importance by regime (from 08)
-- Methodology note on conformal prediction and Syntetos-Boylan classification
+* FOODS
+* HOBBIES
+* HOUSEHOLD
 
----
+Produce:
 
-## Production System Design (README Section)
+* top 10 features per department
+* rank correlation
+* department-specific importance differences
 
-*Demonstrates understanding of real-world ML systems.*
+This is primarily a portfolio/model-audit section.
 
-### Retraining Pipeline
-- Weekly recompute: ADI + CV² per SKU from expanding training window
-- Regime reclassification with 4-week hysteresis gate
-- Monthly model retrain on expanding window (frozen hyperparams)
-- Conformal residuals refit from most recent N weeks of production data
+Question:
 
-### Monitoring
-- Rolling per-SKU WAPE tracked weekly — alert if p90 drifts > 10%
-- Quantile coverage monitoring — alert if q90 drops below 85%
-- Regime change detection — flag SKUs transitioning regimes
-- Demand spike detection via residual z-scores
+> **Does the model learn broadly consistent demand drivers across product categories, or are there meaningful department-specific differences?**
 
-### Inference
-- Batch forecasting at 7, 28, 90-day horizons
-- All predictions stored as parquet for downstream consumption
-- Zero model inference at query time
+### Output
+
+`shap_by_department_fold3.parquet`
 
 ---
 
-## Execution Order and Time Estimates
+## Section 4 — Per-SKU Explainability
 
-| Step | Notebook | Est. time | Blocking dependency |
-|---|---|---|---|
-| 0 | Lock `06b` winner decision | 30 min | None — do immediately |
-| 1 | `06c` SKU audit + regime classification | 2–3 hrs | 06b locked |
-| 2 | `06d` Model optimization | 3–4 hrs | 06c complete |
-| 3 | `06e` Conformal prediction | 2–3 hrs | 06d complete |
-| 4 | `06f` Intermittent demand (Croston/TSB) | 2–3 hrs | 06c complete (parallel with 06d/06e) |
-| 5 | `06g` Inventory simulation | 3–4 hrs | 06e + 06f complete |
-| 6 | `07` Fold 3 — run once | 3–4 hrs | ALL above locked |
-| 7 | `08` Explainability | 2–3 hrs | 07 complete |
-| 8 | `09` App data prep | 1–2 hrs | 07 + 08 complete |
-| 9 | `app.py` Streamlit | 2–3 days | 09 complete |
-| 10 | README + portfolio | Half day | All above complete |
+This is the most important 08 output for the app.
 
-**Total modeling work before app:** ~5–6 focused sessions.
+For every eligible Smooth/Erratic SKU at the chosen Fold 3 prediction snapshot, save the five largest SHAP contributors.
 
-`06f` (Croston/TSB) can run in parallel with `06d` and `06e` since it only
-depends on `06c` regime assignments and does not require the optimized
-Tweedie model.
+Schema:
 
----
+| Column          | Description           |
+| --------------- | --------------------- |
+| `id`            | SKU                   |
+| `date`          | prediction date       |
+| `feature`       | production feature    |
+| `feature_value` | value seen by model   |
+| `shap_value`    | SHAP contribution     |
+| `abs_shap`      | absolute contribution |
+| `rank`          | 1–5                   |
 
-## Key Decisions Locked — Do Not Revisit
+Preserve direction:
 
-| Decision | Rationale |
-|---|---|
-| Production model: LightGBM Tweedie | Best per-SKU demand ratio, unit-space predictions, no retransformation bias |
-| Global calibration: rejected | Overcorrects at series level. Demand ratio 2.3–2.5× median post-calibration |
-| Department corrections: rejected | Same architectural flaw as global calibration at finer granularity |
-| SKU routing: Syntetos-Boylan ADI/CV² | Data property — no ground truth needed, recomputes on expanding window, industry standard |
-| Uncertainty: conformal prediction | Coverage-guaranteed intervals from one model, no quantile crossing, all service levels |
-| Intermittent SKUs: Croston/TSB | Architecturally correct for zero-inflated intermittent demand. ML not the right tool here |
-| Optimization: evaluate on per-SKU weekly WAPE | Aggregate metrics mask SKU-level behavior and are useless for inventory decisions |
-| Fold 3: run once, results locked | Non-negotiable. Any retrain after seeing Fold 3 is leakage |
-| Hysteresis: 4-week gate | Prevents regime boundary flip-flopping in production |
+* positive SHAP → pushes forecast upward
+* negative SHAP → pushes forecast downward
+
+The application can therefore answer:
+
+> **Why is this forecast high/low?**
+
+### Output
+
+`shap_per_sku_fold3.parquet`
 
 ---
 
-## The Portfolio Narrative at the End
+## Section 5 — Representative Explainability Cases
 
-The repository tells a complete, auditable story:
+Create four representative examples:
 
-1. **EDA** — understand demand structure and sparsity
-2. **Baselines** — SARIMA and Prophet establish signal ceiling
-3. **Feature engineering v1 → v2** — principled improvement from diagnostics
-4. **XGBoost v1 → v2 → LightGBM Tweedie** — model progression with documented rationale
-5. **Model selection** — Tweedie wins; global calibration rejected by evidence
-6. **SKU audit** — demand regime classification, not aggregate metrics
-7. **Optimization** — targeted improvement on the right SKU segment
-8. **Uncertainty quantification** — conformal prediction, coverage guaranteed
-9. **Intermittent handling** — Croston/TSB where ML cannot forecast reliably
-10. **Inventory simulation** — stockout rate and fill rate on holdout data
-11. **Fold 3** — one clean production simulation, never touched before this moment
-12. **Explainability** — SHAP confirms model learns the right demand drivers
-13. **App** — any SKU, any service level, reorder recommendation in < 60 seconds
+### Smooth
 
-**The headline you say in every interview:**
+Show:
 
-> "On the Fold 3 holdout, the dynamic periodic-review policy beats a traditional
-> static reorder policy even at static's own best-case service level, by [X]%–[Y]%
-> across a real-cost sensitivity grid — not just at naive or an arbitrarily-chosen
-> service level. Estimated annual savings of $Z at representative retail cost
-> assumptions. Intermittent SKUs are handled via Croston/TSB rather than forcing
-> a global ML model onto data with insufficient signal."
+* recent demand
+* forecast
+* SHAP waterfall
+* top positive drivers
+* top negative drivers
 
-Fill in X, Y, Z from Phase E (Fold 2) simulation results as soon as 06g is
-complete. Do not wait for Fold 3. Fold 2 numbers anchor the story; Fold 3
-confirms it.
+### Erratic
 
-## Minimum Viable Production System
+Show:
 
-*Answer this question before every interview: "If you had two weeks, what
-ships?"*
+* recent demand volatility
+* forecast
+* SHAP waterfall
+* top drivers
 
-The irreducible core of this system is four components. Everything else is
-supporting analysis and diagnostics:
+### Intermittent
 
-1. **LightGBM Tweedie** — point forecasts for Smooth and Erratic SKUs
-2. **Croston/TSB routing** — principled forecasts for Intermittent/Lumpy SKUs
-   where the global model has no signal
-3. **Conformal prediction wrapper** — coverage-guaranteed intervals from one
-   calibration step, no distributional assumptions
-4. **Inventory simulation layer** — converts forecasts to reorder decisions
-   and measures business outcomes, not just accuracy
+Do **not** show SHAP.
 
-Every other notebook (optimization branches, SHAP by regime, coverage
-validation tables, anomaly detection) strengthens the case for these four
-components. None of them are the system. If an interviewer asks "what would
-you cut?", the answer is: the optimization search in 06d becomes a fixed
-hyperparameter set, and the SHAP analysis becomes a single global importance
-chart. The four components above do not get cut.
+Instead show:
 
-**The whiteboard version (practice this):**
+* ADI
+* CV²
+* regime classification
+* TSB forecast
+* routing decision
+* inventory recommendation
 
-Raw sales data
-↓
-ADI + CV² per SKU  →  Regime classification (Syntetos-Boylan)
-↓                        ↓
-Smooth/Erratic           Intermittent/Lumpy
-↓                        ↓
-LightGBM Tweedie          Croston/TSB
-↓                        ↓
-Conformal intervals      Native uncertainty
-↓                        ↓
-└──────────┬─────────────┘
-↓
-Reorder point + safety stock
-↓
-Inventory simulation → Fill rate, stockout rate, cost
+Explain:
+
+> This SKU is routed to TSB because its demand pattern is intermittent.
+
+### Lumpy
+
+Show:
+
+* ADI
+* CV²
+* regime classification
+* historical policy inputs
+* reorder point
+* order quantity
+
+Explain:
+
+> This SKU is routed to the historical policy rather than the global ML model.
+
+These four examples demonstrate the entire production routing architecture.
 
 ---
 
-Every notebook is a frozen artifact. Every decision is documented and justified.
-The before-and-after narrative is built into the repository structure.
-The system answers the question that matters in production:
-**not how accurate is the forecast, but how good are the inventory decisions.**
+## Section 6 — Explainability QA
+
+Validate the SHAP outputs before passing them to the app.
+
+Checks:
+
+* no NaN/Inf SHAP values
+* feature names match production feature columns
+* top features are valid production features
+* SHAP reconstruction error is acceptably small
+* every eligible SKU has expected top-feature records
+* no obvious leakage/proxy feature dominates unexpectedly
+
+Save:
+
+`shap_validation_report.json`
+
+### Explicitly removed from Notebook 08
+
+Do not perform simple residual z-score anomaly detection here.
+
+Fold 3 residuals are strongly right-skewed, so conventional z-scores are not the appropriate production anomaly detector.
+
+A robust monitoring system can be designed separately using rolling quantiles/MAD/etc.
+
+---
+
+# Phase H — Application Data Preparation
+
+## Notebook: `09_app_data_prep.ipynb`
+
+### Purpose
+
+Convert the **frozen Fold 3 production system** into compact, versioned artifacts for Streamlit.
+
+Notebook 09 performs:
+
+* no model training
+* no hyperparameter tuning
+* no model selection
+* no new holdout evaluation
+* no SHAP calculation
+* no expensive simulation at runtime
+
+All expensive computation occurs here.
+
+The application reads precomputed data and performs only lightweight deterministic calculations.
+
+---
+
+# Section 1 — App Dataset Manifest
+
+Create a single manifest describing the exact model/data version used by the app.
+
+`app_manifest.json`
+
+Include:
+
+* project version
+* model filename/version
+* model architecture
+* Fold 3 validation period
+* forecast data-as-of date
+* feature version
+* regime threshold version
+* service-level configuration
+* lead-time configuration
+* artifact list
+* row counts
+* generation timestamp
+
+The app should read this manifest first.
+
+If artifact versions do not match, the app should fail clearly rather than silently mixing outputs.
+
+---
+
+# Section 2 — SKU Master / Metadata Table
+
+Create the master lookup table used throughout the app.
+
+For every SKU include:
+
+* `id`
+* `item_id`
+* `store_id`
+* `dept_id`
+* `cat_id`
+* `state_id`
+* mean weekly demand
+* median weekly demand
+* zero-demand rate
+* ADI
+* CV²
+* regime
+* routing method
+* latest available demand
+* data-as-of date
+* price
+
+### Output
+
+`app_sku_metadata.parquet`
+
+This becomes the primary dimension table.
+
+---
+
+# Section 3 — Frozen Production Forecasts
+
+Use the exact Fold 3 production model and existing Fold 3 forecast artifacts.
+
+For Smooth/Erratic SKUs, prepare:
+
+* forecast date
+* forecast horizon
+* point forecast
+* q50
+* q75
+* q80
+* q90
+* q95
+* q99
+
+The application should support:
+
+* 7-day summary
+* 28-day forecast
+* weekly aggregation
+
+For the initial portfolio app, the main display horizon is 28 days.
+
+### Important
+
+The app must clearly display:
+
+> **Forecast data as of: [date]**
+
+The M5 dataset is historical. The application is a reproducible historical decision-support demonstration, not a live retailer deployment.
+
+### Output
+
+`app_forecasts.parquet`
+
+---
+
+# Section 4 — Regime-Specific Forecasting Data
+
+Create a unified forecast table so the app does not need to know the implementation details.
+
+For each SKU:
+
+| Field                | Meaning                           |
+| -------------------- | --------------------------------- |
+| `id`                 | SKU                               |
+| `regime`             | Smooth/Erratic/Intermittent/Lumpy |
+| `forecast_method`    | Tweedie/TSB/Policy                |
+| `forecast`           | primary demand forecast           |
+| `uncertainty_method` | Conformal/Native/Policy           |
+| `service_level`      | requested level                   |
+
+For Intermittent:
+
+* TSB forecast
+* relevant uncertainty inputs
+
+For Lumpy:
+
+* policy-based demand estimate
+* no fake ML prediction
+
+### Output
+
+`app_regime_forecasts.parquet`
+
+---
+
+# Section 5 — Inventory Recommendations
+
+Precompute inventory-policy outputs for the validated production configuration.
+
+Primary production configuration:
+
+* 7-day lead time
+* 1-week review period
+* q80
+
+Also precompute supported alternative service levels:
+
+* q90
+* q95
+* q99
+
+Store:
+
+* expected lead-time demand
+* safety stock
+* reorder point
+* order quantity
+* service level
+* method
+* regime
+
+### Important
+
+The app's **validated production configuration is 7 days**.
+
+Do not present 14-day results as validated Fold 3 results.
+
+If the app exposes 14 days later, label it as:
+
+> Scenario estimate — not directly validated on Fold 3.
+
+For the first release, 7 days should be the default and primary production view.
+
+### Output
+
+`app_inventory_policy.parquet`
+
+---
+
+# Section 6 — Per-SKU Explainability Data
+
+Join Notebook 08 SHAP results into a clean app table.
+
+For each eligible Smooth/Erratic SKU:
+
+* top 5 features
+* feature values
+* SHAP values
+* positive/negative direction
+* rank
+
+Create a controlled feature-description dictionary.
+
+Example:
+
+```text
+lag_7
+→ Recent demand one week ago
+
+price
+→ Historical selling price
+
+snap_proximity
+→ Proximity to SNAP-related calendar effects
+```
+
+The app uses these descriptions instead of generating explanations dynamically.
+
+For Intermittent/Lumpy SKUs:
+
+* routing explanation
+* regime reason
+* forecast method explanation
+
+### Output
+
+`app_explainability.parquet`
+
+---
+
+# Section 7 — Portfolio Risk Table
+
+Precompute the full SKU-level monitoring table.
+
+Include:
+
+* current/latest inventory input placeholder
+* forecast
+* lead-time demand
+* reorder point
+* safety stock
+* days/weeks of supply
+* regime
+* routing method
+* recent forecast error
+* recent demand volatility
+* stockout-risk flag
+* risk category
+* regime-change flag
+
+Risk categories should be deterministic.
+
+Example:
+
+### Critical
+
+Projected stockout within lead time.
+
+### Watch
+
+Inventory below reorder point or recent forecast deterioration.
+
+### Normal
+
+No immediate issue detected.
+
+The app can filter by:
+
+* store
+* department
+* category
+* state
+* regime
+* risk tier
+
+### Output
+
+`app_portfolio_risk.parquet`
+
+---
+
+# Section 8 — Historical Model Performance
+
+Create compact app-facing validation tables from the existing notebooks.
+
+Include:
+
+### Forecasting
+
+* Naive
+* SARIMA
+* Prophet
+* XGBoost
+* LightGBM/Tweedie
+
+Metrics:
+
+* log-RMSE
+* WAPE
+* bias
+* median
+* p90
+
+### Fold 3
+
+* median WAPE by regime
+* p90 WAPE by regime
+* regime distribution
+* stockout rate
+* weekly in-stock rate
+* unit fill rate
+* average inventory
+* modeled annual cost
+
+Do not recompute the expensive analyses.
+
+### Output
+
+`app_model_results.parquet`
+
+`app_inventory_results.parquet`
+
+---
+
+# Section 9 — Cost Sensitivity Data
+
+Use the already-computed Fold 3 artifacts.
+
+Expose all 24 scenarios:
+
+* stockout penalty
+* carrying rate
+* naive cost
+* dynamic cost
+* best tested static cost
+* dynamic vs naive
+* dynamic vs best tested static
+
+Terminology must consistently say:
+
+> **best tested static configuration**
+
+not theoretical optimum.
+
+### Outputs
+
+`app_cost_sensitivity.parquet`
+
+---
+
+# Section 10 — App-Level Data Validation
+
+Before touching Streamlit, run automated checks.
+
+Verify:
+
+* every SKU exists in metadata
+* every SKU has a regime
+* every production SKU has the appropriate forecast
+* Smooth/Erratic SKUs have SHAP data
+* Intermittent/Lumpy SKUs have routing explanations
+* inventory recommendations exist where required
+* no duplicate SKU/date rows
+* no NaN/Inf in required numeric fields
+* q99 ≥ q95 ≥ q90 ≥ q80 where applicable
+* reorder quantities are positive
+* dates align across all artifacts
+* IDs join cleanly
+* artifact versions match manifest
+* Fold 3 evaluation artifacts are unchanged
+
+Test at least one SKU from each regime.
+
+### Output
+
+`app_validation_report.json`
+
+---
+
+# Section 11 — Prepare App Bundles
+
+Create an app-ready directory with only the artifacts Streamlit actually needs.
+
+For example:
+
+```text
+app_data/
+├── app_manifest.json
+├── app_sku_metadata.parquet
+├── app_forecasts.parquet
+├── app_regime_forecasts.parquet
+├── app_inventory_policy.parquet
+├── app_explainability.parquet
+├── app_portfolio_risk.parquet
+├── app_model_results.parquet
+├── app_inventory_results.parquet
+├── app_cost_sensitivity.parquet
+└── app_validation_report.json
+```
+
+The Streamlit app should load this directory, not reach into the modeling notebooks' working files.
+
+---
+
+# Deployment Layer — Streamlit
+
+## `app.py`
+
+The application should behave like a small decision-support product, not like a notebook viewer.
+
+The central question is:
+
+> **What should I do about this SKU right now, and why?**
+
+Every page should share the same SKU context.
+
+---
+
+# Page 0 — Executive Overview
+
+This is the landing page.
+
+Within ~20 seconds a recruiter should understand:
+
+### System size
+
+* total SKUs
+* stores
+* departments
+
+### Demand mix
+
+* Smooth %
+* Erratic %
+* Intermittent %
+* Lumpy %
+
+### Risk
+
+* critical SKUs
+* watch SKUs
+* regime changes
+
+### Business result
+
+* dynamic vs naive
+* dynamic vs best tested static
+* representative modeled savings
+
+### Validation
+
+* Fold 3 validation period
+* model version
+* data-as-of date
+
+Also show the architecture visually:
+
+```text
+Demand
+  ↓
+ADI + CV²
+  ↓
+Regime Router
+  ├── Smooth / Erratic → Tweedie → Conformal
+  └── Intermittent / Lumpy → TSB / Policy
+                         ↓
+                  Inventory Decision
+                         ↓
+              Risk + Cost + Recommendation
+```
+
+This page is primarily for recruiters and portfolio visitors.
+
+---
+
+# Page 1 — SKU Inventory Dashboard
+
+This is the main user experience.
+
+Answers:
+
+> **What should I do about this SKU?**
+
+## Inputs
+
+* Store
+* SKU
+* Current inventory
+* Lead time
+* Service level
+
+Defaults:
+
+* 7 days
+* q80
+
+## SKU profile
+
+Show:
+
+* item
+* store
+* department
+* category
+* state
+* regime
+* ADI
+* CV²
+* zero-demand rate
+* forecast method
+
+## Demand forecast
+
+Show:
+
+* historical recent demand
+* 28-day point forecast
+* uncertainty band
+* data-as-of date
+
+## Inventory recommendation
+
+Show:
+
+* current inventory
+* reorder point
+* safety stock
+* recommended order quantity
+* estimated days/weeks of coverage
+* projected stockout date
+
+## Risk
+
+Show:
+
+* Critical / Watch / Normal
+* reason
+
+## Explainability
+
+Smooth/Erratic:
+
+> Top demand drivers
+
+Intermittent/Lumpy:
+
+> Why this forecasting method is being used
+
+---
+
+# Page 2 — Portfolio Risk Monitor
+
+Answers:
+
+> **Which SKUs need attention?**
+
+Provide a searchable/filterable table with:
+
+* SKU
+* store
+* department
+* category
+* forecast
+* current inventory
+* reorder point
+* days of supply
+* regime
+* forecast method
+* risk tier
+* recent error
+* volatility
+
+Filters:
+
+* store
+* department
+* category
+* state
+* regime
+* risk
+
+Visual states:
+
+### Critical
+
+Projected stockout within lead time.
+
+### Watch
+
+Below reorder point or deterioration in forecast/error conditions.
+
+### Regime Change
+
+Routing changed after the production hysteresis rule.
+
+Allow the user to download the filtered table.
+
+---
+
+# Page 3 — Service Level & Cost Simulator
+
+Answers:
+
+> **What does better service cost me?**
+
+Interactive service-level selection:
+
+* q50
+* q75
+* q80
+* q90
+* q95
+* q99
+
+Display:
+
+* stockout rate
+* weekly in-stock rate
+* unit fill rate
+* average inventory
+* modeled annual cost
+
+Charts:
+
+### Cost vs service level
+
+### Inventory vs service level
+
+### Stockout vs service level
+
+Also show:
+
+> Dynamic vs best tested static configuration
+
+across the 24 cost scenarios.
+
+Clearly separate:
+
+**validated Fold 3 results**
+
+from:
+
+**user-selected scenario calculations.**
+
+---
+
+# Page 4 — Explainability
+
+Answers:
+
+> **Why did the system forecast this?**
+
+For Smooth/Erratic:
+
+* SHAP waterfall
+* top five features
+* feature values
+* positive/negative contribution
+* plain-English explanation
+
+Example:
+
+> Recent weekly demand is increasing the expected demand.
+
+For Intermittent:
+
+> This SKU is classified as Intermittent based on ADI/CV² and is routed to TSB rather than the global ML model.
+
+For Lumpy:
+
+> This SKU is classified as Lumpy and uses a historical inventory policy rather than the ML forecast.
+
+Do not call SHAP a causal explanation.
+
+Do not show "price elasticity" unless a separate causal/sensitivity analysis has actually been performed.
+
+---
+
+# Page 5 — Technical Deep Dive
+
+For technical interviewers.
+
+Include:
+
+### Model progression
+
+* Naive
+* SARIMA
+* Prophet
+* XGBoost
+* LightGBM/Tweedie
+
+### Forecast metrics
+
+* per-fold log-RMSE
+* WAPE
+* p90 WAPE
+* bias
+
+### Inventory metrics
+
+* stockout
+* weekly in-stock
+* unit fill
+* inventory
+* cost
+
+### Fold 2 → Fold 3
+
+Show:
+
+* stable forecast metrics
+* changed regime mix
+* downstream policy effects
+* known caveats
+
+### Explainability
+
+* global SHAP
+* SHAP by regime
+* SHAP by department
+
+### Methodology
+
+Expandable explanations for:
+
+* Tweedie
+* ADI/CV²
+* TSB
+* conformal prediction
+* periodic-review inventory
+* cost model
+
+This page is designed primarily for technical reviewers.
+
+---
+
+# Application Performance Requirements
+
+Target:
+
+* initial load <3 seconds
+* SKU interactions <1 second
+* no model inference at runtime
+* no SHAP at runtime
+* no full inventory simulation at runtime
+* cached Parquet data
+* efficient indexed lookups
+
+The app may perform lightweight arithmetic for:
+
+* stockout projection
+* service-level changes
+* filtering
+* aggregation
+* scenario display
+
+---
+
+# Application Scientific Guardrails
+
+The UI must clearly distinguish three things:
+
+## 1. Final validated result
+
+Fold 3 holdout performance.
+
+## 2. Frozen production/demo model
+
+The exact model artifact:
+
+`tweedie_optimized_fold3.txt`
+
+## 3. User-selected scenario
+
+Examples:
+
+* different service level
+* different current inventory
+* different lead time scenario
+
+Scenario results are not automatically validated outcomes.
+
+---
+
+# Production-System Design
+
+## Retraining concept
+
+For a real deployed retailer system, a future version would:
+
+### Weekly
+
+* ingest new demand
+* recompute ADI/CV²
+* evaluate the 4-week regime hysteresis gate
+* refresh forecasts
+* update inventory policies
+
+### Monthly
+
+* retrain the frozen architecture
+* refresh calibration
+* run validation gates
+* promote a new model version only when criteria are satisfied
+
+The portfolio application itself does **not** perform this retraining.
+
+---
+
+# Monitoring
+
+Monitor:
+
+## Forecast
+
+* rolling per-SKU WAPE
+* bias
+* p90 error
+* regime-specific degradation
+
+## Calibration
+
+* empirical coverage vs target
+* alert when coverage deteriorates materially
+
+## Regimes
+
+* regime transitions
+* threshold proximity
+* hysteresis-triggered changes
+
+## Inventory
+
+* stockout rate
+* unit fill rate
+* weekly in-stock rate
+* average inventory
+* order frequency
+
+## Data quality
+
+* missing dates
+* missing SKU observations
+* price anomalies
+* feature drift
+* unexpected SKU/store changes
+
+---
+
+# Versioning
+
+Every production/demo artifact should have:
+
+* project version
+* model version
+* feature version
+* regime version
+* calibration version
+* data-as-of date
+* creation timestamp
+
+This allows the app to answer:
+
+> **Exactly which model and data produced this recommendation?**
+
+---
+
+# Final Architecture
+
+```text
+                 NOTEBOOKS
+────────────────────────────────────────────
+
+06 — DEVELOPMENT
+  Model selection
+  Regime logic
+  Uncertainty
+  TSB
+  Inventory policy
+             │
+             ▼
+     EVERYTHING FROZEN
+             │
+             ▼
+07 — FINAL FOLD 3
+  One untouched holdout
+  Final model
+  Final forecasts
+  Final inventory evaluation
+             │
+             ▼
+08 — EXPLAINABILITY
+  Global SHAP
+  Regime SHAP
+  Department SHAP
+  Per-SKU explanations
+             │
+             ▼
+09 — APP DATA PREP
+  Forecasts
+  Policies
+  Metadata
+  Risk
+  SHAP
+  Validation
+  Manifest
+             │
+             ▼
+       STREAMLIT APP
+             │
+      ┌──────┼────────┐
+      ▼      ▼        ▼
+   Forecast Risk   Explain
+      │      │        │
+      └──────┼────────┘
+             ▼
+       Inventory Decision
+             │
+             ▼
+           Cost
+```
+
+---
+
+# Execution Order From Here
+
+| Step | Artifact       | Purpose                                        |
+| ---- | -------------- | ---------------------------------------------- |
+| 1    | Notebook 07    | **Already frozen**                             |
+| 2    | Notebook 08    | Explain the exact frozen Fold 3 model          |
+| 3    | Notebook 09    | Convert frozen outputs into app-ready datasets |
+| 4    | App validation | Make sure all app contracts are complete       |
+| 5    | `app.py`       | Build the recruiter-facing product             |
+| 6    | README         | Explain system architecture and evidence       |
+| 7    | Portfolio      | Present the project and results                |
+
+---
+
+# What Is Actually "Production" in This Project?
+
+The exact frozen production/demo system is:
+
+```text
+tweedie_optimized_fold3.txt
++
+sku_regimes_fold3.parquet
++
+conformal_residuals_fold3.pkl
++
+TSB parameters
++
+Lumpy policy
++
+inventory-policy logic
++
+Fold 3 forecast artifacts
+```
+
+That exact system is what Notebook 08 explains and Notebook 09 packages.
+
+**Fold 3 remains untouched.**
+
+The app therefore demonstrates the **same system whose performance you report**, which makes the portfolio story unusually clean.
+
+---
+
+# Final Portfolio Narrative
+
+The project should be presented as:
+
+> **I built a demand-to-inventory decision system, not simply a forecasting model.**
+
+The system first classifies SKU demand structure using ADI/CV². Smooth and Erratic SKUs use LightGBM Tweedie with conformal uncertainty; Intermittent SKUs use TSB; Lumpy SKUs use a historical policy. Those outputs feed a periodic-review inventory layer that converts forecasts into reorder decisions and evaluates the economic tradeoff between inventory and stockouts.
+
+The entire production configuration was frozen before Fold 3. Fold 3 was then run exactly once as an untouched final holdout. The same frozen system is what powers the portfolio application.
+
+On Fold 3, the dynamic policy produced **87.5%–91.8% lower modeled annual cost than the best tested static configuration** and **92.7%–95.4% lower modeled annual cost than the naive baseline** across 24 cost scenarios, with **93.8% lower modeled cost than naive in the representative 2.0× stockout / 25% carrying-cost scenario**.
+
+The application makes that system tangible:
+
+> **Select a SKU → understand its demand → see the forecast → understand why → see the inventory risk → receive a reorder recommendation → explore the cost/service tradeoff.**
+
+That is the main portfolio product.
